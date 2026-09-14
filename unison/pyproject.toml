@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "unison-harness"
+version = "0.1.0"
+description = "Local event-driven multi-model collaboration"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+unison = "unison.server:main"
+
+[tool.setuptools]
+packages = ["unison"]
+
+[tool.setuptools.package-data]
+# 内置技能随包分发：SKILL.md、脚本与参考资料都必须在 wheel 里，
+# 否则装到别处运行时运行时目录会空掉，技能静默消失（诊断里才会看到）。
+unison = ["web/*.html", "web/*.css", "web/*.svg", "web/js/*.js",
+          "skills/*/SKILL.md", "skills/*/scripts/*.py", "skills/*/references/*.json",
+          "skills/*/references/*.md"]

@@ -1,0 +1,33 @@
+# 凭据与本机运行数据：不随仓库分发。
+apikey.txt
+.env
+*.local
+
+# Unison 数据目录（SQLite、api_token、内容对象、归档）与默认工作区。
+unison/.unison/
+unison/.unison-workspace/
+.unison/
+.unison-workspace/
+
+# 基准运行产物：含明文凭据与完整会话记录，只保留各阶段契约文本。
+benchmarks/*/runs/*
+!benchmarks/*/runs/*.md
+!benchmarks/*/runs/*.txt
+
+# 参考资料与第三方实现：体积大，且不属于本仓库。
+papers/
+repositories/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+.coverage
+htmlcov/
+
+# 编辑器 / 系统
+.DS_Store
+*.swp

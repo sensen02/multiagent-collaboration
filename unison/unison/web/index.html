@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="light">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>MultiAgent_Collaboration</title>
+<link rel="icon" href="/favicon.svg">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<div class="app">
+  <header class="topbar">
+    <button class="icon-btn narrow-only" id="sidebar-toggle" aria-label="展开任务列表" aria-expanded="false" aria-controls="sidebar">☰</button>
+    <a class="brand" href="/" aria-label="MultiAgent_Collaboration 首页">
+      <svg class="brand-mark" viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.4">
+        <circle cx="9" cy="9" r="4.2"></circle>
+        <circle cx="15" cy="15" r="4.2"></circle>
+      </svg>
+      <span class="brand-name">MultiAgent_Collaboration</span>
+      <span class="brand-sub">Console</span>
+    </a>
+    <div class="topbar-mid" id="breadcrumb"></div>
+    <div class="topbar-end">
+      <span class="conn" id="conn" role="status" aria-live="polite"><i class="conn-dot"></i><span class="conn-text">连接中</span></span>
+      <button class="btn sm" id="skills-btn">技能</button>
+      <button class="btn sm" id="models-btn">模型</button>
+    </div>
+  </header>
+
+  <div class="workspace">
+    <aside class="sidebar" id="sidebar" aria-label="任务列表">
+      <div class="sidebar-top">
+        <button class="btn primary block" id="new-run-btn">新建任务</button>
+        <div class="search">
+          <input id="run-search" type="search" placeholder="搜索任务目标" aria-label="搜索任务目标" autocomplete="off">
+          <kbd>/</kbd>
+        </div>
+        <div class="chips" id="run-filters" role="group" aria-label="按状态筛选"></div>
+      </div>
+      <nav class="run-list" id="run-list"></nav>
+      <div class="sidebar-foot" id="sidebar-foot"></div>
+    </aside>
+
+    <main class="main" id="main" tabindex="-1"></main>
+
+    <aside class="drawer" id="drawer" hidden aria-label="任务详情"></aside>
+  </div>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite" aria-atomic="false"></div>
+
+<dialog id="dlg-new" class="dialog">
+  <form id="form-new" class="form" novalidate>
+    <header class="dialog-head">
+      <h2>新建任务</h2>
+      <button type="button" class="icon-btn" data-close aria-label="关闭">✕</button>
+    </header>
+    <label class="field">
+      <span class="field-label">目标</span>
+      <textarea name="goal" rows="4" required placeholder="希望完成什么？验收标准是什么？"></textarea>
+    </label>
+    <label class="field">
+      <span class="field-label">主模型</span>
+      <select name="model_id" id="new-model" required></select>
+      <span class="hint">主模型负责调度；评分按综合分降序，来源 <a href="https://llm-stats.com/" target="_blank" rel="noopener noreferrer">Data by LLM Stats ↗</a>，未匹配评分的模型仍可选择。</span>
+      <span class="note warn" id="new-model-warning" role="alert" hidden></span>
+    </label>
+    <label class="field">
+      <span class="field-label">项目目录</span>
+      <input name="workspace" id="new-workspace" required placeholder="/home/user/project" spellcheck="false">
+      <span class="hint">主模型会直接修改该目录。子任务在独立副本中执行，成果可集成回来。</span>
+    </label>
+    <div class="form-error" id="new-error" hidden></div>
+    <footer class="dialog-foot">
+      <button type="button" class="btn" data-close>取消</button>
+      <button type="submit" class="btn primary">创建并运行</button>
+    </footer>
+  </form>
+</dialog>
+
+
+<dialog id="dlg-revise" class="dialog">
+  <form id="form-revise" class="form" novalidate>
+    <header class="dialog-head">
+      <h2>修改核心目标</h2>
+      <button type="button" class="icon-btn" data-close aria-label="关闭">✕</button>
+    </header>
+    <label class="field">
+      <span class="field-label">新目标</span>
+      <textarea name="goal" rows="4" required></textarea>
+    </label>
+    <p class="note warn">切换目标会停止旧任务树并开启新版本。已经写入项目目录的文件不会自动回滚，旧成果可在新版本中重新采纳。</p>
+    <div class="form-error" id="revise-error" hidden></div>
+    <footer class="dialog-foot">
+      <button type="button" class="btn" data-close>取消</button>
+      <button type="submit" class="btn primary">切换目标版本</button>
+    </footer>
+  </form>
+</dialog>
+
+<dialog id="dlg-models" class="dialog wide">
+  <div class="form">
+    <header class="dialog-head">
+      <div class="dialog-title-block">
+        <h2>模型与 Provider</h2>
+        <p>Provider 决定接口协议与地址，模型决定上下文与输出上限；调用接口由 api 统一决定。</p>
+      </div>
+      <button type="button" class="icon-btn" data-close aria-label="关闭">✕</button>
+    </header>
+    <div id="models-body"></div>
+    <form class="form nested" id="form-import">
+      <label class="field">
+        <span class="field-label">导入 Provider 配置</span>
+        <textarea name="config" class="config-editor" rows="8" spellcheck="false" placeholder="粘贴 DSH 的 llm-pi-ai provider 片段，或 Codex TOML（mode=responses/chat_completions）"></textarea>
+        <span class="hint">支持 DSH <code>llm-pi-ai.providers</code> 的 YAML/JSON 片段与 Codex TOML；api 支持 <code>openai-completions</code> 与 <code>openai-responses</code>，<code>anthropic-messages</code> 暂不支持。</span>
+      </label>
+      <div class="form-error" id="import-error" hidden></div>
+      <footer class="dialog-foot">
+        <button type="button" class="btn" data-action="refresh-benchmarks">刷新模型评分</button>
+        <span class="spacer"></span>
+        <button type="button" class="btn" data-close>关闭</button>
+        <button type="submit" class="btn primary">导入并扫描模型</button>
+      </footer>
+    </form>
+  </div>
+</dialog>
+
+<dialog id="dlg-skills" class="dialog wide">
+  <div class="form">
+    <header class="dialog-head">
+      <div class="dialog-title-block">
+        <h2>技能目录（Skills）</h2>
+        <p>技能是可复用的任务专用指令：模型只看到名称与摘要，需要时用 <code>skill</code> 工具加载全文。</p>
+      </div>
+      <button type="button" class="icon-btn" data-close aria-label="关闭">✕</button>
+    </header>
+    <div id="skills-body"></div>
+    <footer class="dialog-foot">
+      <span class="hint">扫描 <code>&lt;根&gt;/skills/&lt;name&gt;/SKILL.md</code> 与 <code>&lt;根&gt;/&lt;name&gt;.md</code>；同名由更靠近项目的根胜出。</span>
+      <span class="spacer"></span>
+      <button type="button" class="btn" data-action="reload-skills">重新扫描</button>
+      <button type="button" class="btn" data-close>关闭</button>
+    </footer>
+  </div>
+</dialog>
+
+<script type="module" src="/js/app.js"></script>
+</body>
+</html>

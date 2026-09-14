@@ -1,0 +1,76 @@
+{
+  "note": "可复用的提示词骨架。生成同系列素材时固定 --seed，只改 variables 里的一处，便于保持风格一致。",
+  "patterns": [
+    {
+      "name": "product-mockup",
+      "use_when": "需要一个干净背景上的产品/界面示意，用作文档或落地页配图",
+      "template": "{subject} centered on a seamless {background_color} background, {material} finish, soft studio lighting from upper left, subtle contact shadow, shallow depth of field, no text, no watermark, product photography, 50mm lens",
+      "variables": {
+        "subject": "例如 matte black wireless earbuds case",
+        "background_color": "例如 light gray",
+        "material": "例如 soft-touch plastic"
+      },
+      "negative_hints": "不要让它渲染标签文字，容易出现拼写错误"
+    },
+    {
+      "name": "poster-layout",
+      "use_when": "需要留白给后期排版的背景海报，文字由代码或设计工具叠加",
+      "template": "minimal editorial poster background, {palette} palette, large negative space in the {empty_region}, abstract {motif} shape, flat vector grain texture, high contrast, no lettering, print-ready composition",
+      "variables": {
+        "palette": "例如 warm sand and deep teal",
+        "empty_region": "例如 upper third",
+        "motif": "例如 topographic lines"
+      },
+      "negative_hints": "明确 no lettering，避免模型自己排版出乱码字"
+    },
+    {
+      "name": "app-icon",
+      "use_when": "需要方形图标素材，交给前端或移动端使用时",
+      "template": "flat vector app icon of a {object}, {style} style, thick rounded strokes, centered composition, generous padding inside a square canvas, solid {background} background, no text, crisp edges, svg-like cleanliness",
+      "variables": {
+        "object": "例如 compass 或 paper plane",
+        "style": "例如 duotone 或 neobrutalist",
+        "background": "例如 off-white"
+      },
+      "negative_hints": "方形画布 + 四周留白，避免导出后被裁切"
+    },
+    {
+      "name": "character-sheet",
+      "use_when": "同一角色的多张图要保持一致外观",
+      "template": "character reference sheet of {character}, front view and three-quarter view side by side, consistent proportions and outfit across both views, neutral {background} background, even lighting, full body, no text",
+      "variables": {
+        "character": "例如 a courier with a canvas satchel",
+        "background": "例如 pale blue"
+      },
+      "negative_hints": "固定 --seed；只改 character 描述，其余部分保持不变"
+    },
+    {
+      "name": "texture-seamless",
+      "use_when": "需要可平铺的材质贴图",
+      "template": "seamless tileable {material} texture, top-down orthographic view, even diffuse lighting, no shadows at edges, high detail, repeating pattern, no text",
+      "variables": {
+        "material": "例如 brushed brass 或 recycled paper"
+      },
+      "negative_hints": "生成后需目视检查左右/上下边缘是否接得上；模型对 seamless 承诺并不可靠"
+    },
+    {
+      "name": "concept-landscape",
+      "use_when": "概念图、氛围图或占位背景",
+      "template": "{scene}, {time_of_day}, {weather}, cinematic wide shot, {palette} color grade, volumetric light, atmospheric depth, matte painting style",
+      "variables": {
+        "scene": "例如 a cliffside observatory above a cloud sea",
+        "time_of_day": "例如 blue hour",
+        "weather": "例如 clearing storm",
+        "palette": "例如 cool cyan with warm window light"
+      },
+      "negative_hints": "宽幅时用 --width 1536 --height 864 之类的比例"
+    }
+  ],
+  "verification_checklist": [
+    "文件存在且字节数合理（几十 KB 以上，不是 0 或几百字节的错误页）",
+    "JSON 里的 format / width / height 与预期一致",
+    "需要文字准确时，确认图上没有乱码字；有就重做或改用叠加排版",
+    "同系列素材固定 seed 后风格是否一致",
+    "不要把'生成成功'当成'符合需求'：符合需求需要人或其他模型看图确认"
+  ]
+}

@@ -1,0 +1,9 @@
+[build-system]
+requires = []
+build-backend = "setuptools.build_meta:__legacy__"
+
+[project]
+name = "rail-dispatch-starter"
+version = "1.0.0"
+requires-python = ">=3.9"
+dependencies = []

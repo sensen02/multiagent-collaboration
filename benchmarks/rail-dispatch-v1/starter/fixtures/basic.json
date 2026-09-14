@@ -1,0 +1,1 @@
+{"config":{"section":"A","capacity":1},"events":[{"event_id":"a1","kind":"ARRIVE","ts":1,"train_id":"T1"},{"event_id":"d1","kind":"DEPART","ts":2,"train_id":"T1"}]}

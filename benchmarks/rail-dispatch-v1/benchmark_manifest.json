@@ -1,0 +1,72 @@
+{
+  "name": "rail-dispatch-v1",
+  "version": "1.1.0",
+  "seed": 20240913,
+  "python": ">=3.9",
+  "baseline_score": 32.5,
+  "contract_files": [
+    "runs/stage0.md",
+    "runs/stage1.md",
+    "runs/stage2.md",
+    "runs/stage3.md"
+  ],
+  "starter_files": [
+    "starter/README.md",
+    "starter/fixtures/basic.json",
+    "starter/pyproject.toml",
+    "starter/rail_dispatch/__init__.py",
+    "starter/rail_dispatch/core.py",
+    "starter/rail_dispatch/events.py",
+    "starter/rail_dispatch/model.py",
+    "starter/rail_dispatch/policy.py",
+    "starter/rail_dispatch/state.py",
+    "starter/rail_dispatch/utils.py",
+    "starter/tests/test_public.py"
+  ],
+  "evaluator_files": [
+    "evaluator/score.py",
+    "evaluator/stages/stage1.md",
+    "evaluator/stages/stage2.md",
+    "evaluator/stages/stage3.md",
+    "evaluator/tests/test_hidden.py"
+  ],
+  "harness_files": [
+    "harness/README.md",
+    "harness/audit_proxy.py",
+    "harness/dsh_sdk_driver.mjs",
+    "harness/summarize_usage.py",
+    "harness/test_audit_proxy.py",
+    "harness/unison_driver.py",
+    "harness/summarize_dsh_usage.mjs"
+  ],
+  "sha256": {
+    "starter/README.md": "1e1bbb21bb3fd6248b766f10edde1cc34c745d74bfb9814b7ec12ccd1f84d3fc",
+    "starter/fixtures/basic.json": "7b8833330871f09e4f220256c24155981ca80420ad8ac4a8457271324182519c",
+    "starter/pyproject.toml": "bb9da9d4b0cdfdba2952d1c7fcdc118882c50de428a2bdc92e77c258558e244b",
+    "starter/rail_dispatch/__init__.py": "4c7a8b83d1caaf681a315c463b2d7c848dff1a682dc1c37abe04de351f8ccf96",
+    "starter/rail_dispatch/core.py": "fd18bc7c9a13c200b1c1731fe21e19996c27c8bfa772d8efdc0a45e583082bab",
+    "starter/rail_dispatch/events.py": "9f183a0cecd2982438299ec153bd802a2462978bf79913bf9832dcfd3bb9a847",
+    "starter/rail_dispatch/model.py": "facd3b95506874b416ef258e69ec3d83721f65e05eb6e3691a3fae29ea8a2637",
+    "starter/rail_dispatch/policy.py": "77c58f129405d9e0460e8d74e9889284ee5abe9f4ba0051f4124bacbb01e8023",
+    "starter/rail_dispatch/state.py": "8756afb7e074b2c778b9d30794b14c9552db6226654aee7d22513362910968cc",
+    "starter/rail_dispatch/utils.py": "c08141224ebe94a148b8de3dd482a77289e9dcfccfccee547cdf04fad1e1ea59",
+    "starter/tests/test_public.py": "8684f56b2b9b89a0581e7eec8a6cfab25321e0d772dbb64ceb1ffa306948efb7",
+    "evaluator/score.py": "e0870fad4c46867182589d463c262343a22efef6df6f67266cbc3d0c42e8cd31",
+    "evaluator/stages/stage1.md": "1297a3ebeff2a7901f3af3c3c392cd5cf782f0093a3412e3dde037a8ab4c008f",
+    "evaluator/stages/stage2.md": "335f06ebff72d24d8f950c3b206d63790aef7ae9354a559ff8c25b5a2e4dd31e",
+    "evaluator/stages/stage3.md": "b0ce62ef50234b97576fbb8cb10552ed13bf3cf6bc346a2f3e5af26057ddeb1b",
+    "evaluator/tests/test_hidden.py": "a6522d0932d8c80b31442df7465b6f9be1bdaed8327ab976c179c7b4594ea2d4",
+    "harness/README.md": "d8c074612d8e770722814cb1a400652f378d1e7a880c02fa2fe275be2fa8bf71",
+    "harness/audit_proxy.py": "dbb5bcc22b2ae48642d7c0260856b15d76a547bfc48f9292511fba568eb03e20",
+    "harness/dsh_sdk_driver.mjs": "8f5644e33ee1b68874681550da46f2f032b3ee30adc9f91e1b3bb830a4878d4b",
+    "harness/summarize_usage.py": "78d2dd090c85ecb8c56a2384063acbd261b0abba786d2bb9726e753016d7adac",
+    "harness/test_audit_proxy.py": "b8da795b4589c64ecf43b7c351270f7ad1afeff7c8e0a367b0b58a84d80bac80",
+    "harness/unison_driver.py": "4e7c8733d4bc659289f29daba4e236b8be8de9af1d1ed4ef685d620a70328953",
+    "runs/stage0.md": "cfeb553499d888a8df350de6b94c45ca5b381664f73aff01e5051d1c7b654c96",
+    "runs/stage1.md": "7e8f19bceb0080be25235f4a3f14515fb16e6432535f9fc05826e3af72114780",
+    "runs/stage2.md": "e3425d8dc6da9f337d8a4c788274d190fe7e936fcd16828b0ef6fe4e9d44f53c",
+    "runs/stage3.md": "333e813d95705459cfd829235461b8ae2f4910509efb42d8d5b74b3258bc714a",
+    "harness/summarize_dsh_usage.mjs": "2efb491a47e92bf21bac2bb355a3696e222a9e260b04ec5ced103a2a776c16c0"
+  },
+  "baseline_passed_cases": 13
+}
