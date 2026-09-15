@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from unison.runtime import Runtime, TERMINAL
+from unison.models import ModelError
 from unison.store import dumps, now, uid
 from unison.tools import SYSTEM
 from unison.demo import demo_call
@@ -1219,6 +1220,83 @@ goals=true
             self.assertNotIn('history',task,'任务记录不应携带历史副本')
             self.assertGreater(task.get('history_messages',0),0)
             self.assertGreaterEqual(len(self.r.task_history(task)),task['history_messages'])
+
+
+    # ---- 跨模型故障转移：上游异常换模型，而不是把任务判死 ----
+    #
+    # 判据来自真机 `run_1da778c90c48`：子任务 `task_dd2a34733778` 因网关 503
+    # （"提示词安全审计暂时不可用"）在两次退避后判死；而**同一条 run 里**，
+    # 另一个模型 18 秒后调用成功。上游不可用不是这个任务的错。
+
+    def failover_provider(self, names, **extra):
+        """建一个 provider 与它的模型（都用 fake adapter）。"""
+        record={'id':'P','name':'P','base_url':'test://local','api':'openai-completions',
+                'adapter':'chat-completions','models':[{'id':n} for n in names]}
+        record.update(extra)
+        self.r.store.put('provider',record)
+        for name in names:
+            self.r.store.put('model',{'id':f'P:{name}','model':name,'adapter':'fake','base_url':'test://local',
+                                      'no_key':True,'provider_id':'P','context_window':64000,'max_output':4096})
+        return [f'P:{name}' for name in names]
+
+    @staticmethod
+    def done(summary='ok'):
+        return {'role':'assistant','content':'done','tool_calls':[
+            {'id':'c1','type':'function','function':{'name':'tasks_complete','arguments':dumps({'summary':summary})}}]},{}
+
+    async def test_upstream_error_switches_model_and_the_task_survives(self):
+        """第一个模型 503，候选模型正常 → 任务照常完成，换过谁全程有记录。"""
+        self.failover_provider(['bad','good'])
+        async def adapter(config,messages,tools):
+            if config['model']=='bad':
+                raise ModelError('Model HTTP 503: Service Unavailable：提示词安全审计暂时不可用','SERVER')
+            return self.done()
+        self.r.models.adapters['fake']=adapter
+        run=self.r.create_run('failover',str(self.project),'P:bad')
+        t=self.r.task(run['root_task'])
+        await self.r.start()
+        await self.wait_until(lambda:self.r.task(t['id'])['status']=='completed')
+        fresh=self.r.task(t['id'])
+        self.assertEqual(fresh['model_id'],'P:good')
+        self.assertEqual(fresh['model_failover_from'],'P:bad')
+        self.assertEqual(fresh['model_failover_chain'],['P:bad'])
+        events=[e for e in self.r.store.events(fresh['run_id']) if e['type']=='ModelFailover']
+        self.assertEqual(len(events),1)
+        self.assertEqual(events[0]['payload']['from'],'P:bad')
+        self.assertEqual(events[0]['payload']['to'],'P:good')
+        self.assertEqual(events[0]['payload']['code'],'SERVER')
+        # 换成功之后**继续用新模型**：不再每一轮都先交一次注定失败的调用。
+        self.assertEqual([c['payload']['model'] for c in self.r.store.events(fresh['run_id'])
+                          if c['type']=='ModelCalled'], ['P:bad','P:good'])
+
+    async def test_exhausted_candidates_still_fail_with_the_whole_chain(self):
+        """候选全部失败时仍然判 failed（本轮的选择），但错误里要看得到换过谁。"""
+        self.failover_provider(['bad','also-bad'])
+        async def adapter(config,messages,tools):
+            raise ModelError(f"Model HTTP 503: {config['model']} 不可用",'SERVER')
+        self.r.models.adapters['fake']=adapter
+        run=self.r.create_run('failover exhausted',str(self.project),'P:bad')
+        t=self.r.task(run['root_task'])
+        await self.r.start()
+        await self.wait_until(lambda:self.r.task(t['id'])['status']=='failed')
+        error=self.r.task(t['id'])['error']
+        self.assertIn('SERVER',error)
+        self.assertIn('已尝试故障转移',error)
+        self.assertIn('P:bad',error)
+        self.assertIn('P:also-bad',error)
+
+    async def test_non_model_side_errors_do_not_switch_models(self):
+        """凭据/参数类问题换模型没用，不能拿它当遮羞布去掩盖配置错误。"""
+        self.failover_provider(['bad','good'])
+        async def adapter(config,messages,tools):
+            raise ModelError('模型调用失败：Bad Request','INVALID_REQUEST')
+        self.r.models.adapters['fake']=adapter
+        run=self.r.create_run('no failover',str(self.project),'P:bad')
+        t=self.r.task(run['root_task'])
+        await self.r.start()
+        await self.wait_until(lambda:self.r.task(t['id'])['status']=='failed')
+        self.assertEqual(self.r.task(t['id'])['model_id'],'P:bad')
+        self.assertFalse([e for e in self.r.store.events(t['run_id']) if e['type']=='ModelFailover'])
 
 
 if __name__ == '__main__':

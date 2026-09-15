@@ -89,6 +89,7 @@ Model    = { id, name, description, contextWindow, maxTokens, inputModalities, r
 | **退避重试** | `models.invoke` | `429`/`524`/`520`/`522`/`5xx`/超时按指数退避 + 抖动重试（默认 2 次，尊重 `Retry-After`，上限 120s）；`AUTH`/`MODEL_NOT_FOUND` 等永久错误**不重试** |
 | **用量记账** | `model_usage` 记录 | 每次调用落 `tokens/prompt/completion/排队时长/重试次数`，按 run 与 task 聚合；报告与 `usage_report` 工具可查 |
 | **模型高低搭配** | `models.downgrade_target` | provider 可声明 `tiers: {heavy: [...], light: [...]}`：子任务**未指定模型**且父为 heavy 时自动降到 light 档，并写 `ModelDowngraded` 事件与 `model_downgraded_from` |
+| **上游异常换模型** | `models.failover_targets` | 模型侧的失败（这个模型在本账户下用不了 / 这次答不了）**换一个模型继续做同一件事**，而不是把任务判死；写 `ModelFailover` 事件与 `model_failover_from` / `model_failover_chain` |
 
 配置形状（都向后兼容，缺省即采取保守默认）：
 
@@ -112,6 +113,40 @@ model['tier']        = 'heavy'                # 也可直接标在模型上
 | `concurrency=1`（新默认） | **1** | **0** | **4**（无重试） | 全部成功 |
 
 这张表说明两个机制各管一件事：**重试保证任务不死，闸门保证不去打上游**。
+
+### 上游异常换模型，而不是把任务判死
+
+真机事故：子任务因网关 `HTTP 503 提示词安全审计暂时不可用`，在两次退避（0.33s / 0.77s）后
+**被判 failed**——而**同一条 run 里**另一个模型 18 秒后调用成功。上游不可用不是这个任务的错。
+
+`models.failover_targets(model_id)` 给出"这个模型用不了时按顺序换谁"，与 `downgrade_target`
+对称（那边为省钱降档，这边为活下来升档）。候选来源按优先级：
+
+```python
+provider['failover'] = ['gpt-6-astra', 'other-provider:gpt-x']   # ① 显式顺序，写全可跨 provider
+provider['tiers']    = {'light': [...], 'standard': [...], 'heavy': [...]}   # ② 档位向上 light→standard→heavy
+# ③ 兜底：同 provider 下的其他模型，按目录声明顺序
+```
+
+候选必须**存在**且**不是 `blocked`**（与降档同一条底线：宁可不换，也不静默换成一个同样用不了的模型）。
+换成功时写 `ModelFailover{from,to,code,source}` 事件，任务上记 `model_failover_from` 与
+`model_failover_chain`，并且**后续继续用新模型**——否则故障期间每一轮都要先交一次注定失败的调用。
+
+**换模型只对"模型侧"的原因有用**，分流复用 `_VERDICTS` 已有的分类（`FAILOVER_CODES`）：
+
+| 错误码 | 重试有用吗 | 换模型有用吗 |
+|---|---|---|
+| `MODEL_NOT_SUPPORTED`（账户类型不支持，实测 gpt-5.4-mini）、`MODEL_NOT_FOUND` | 无用 | **有用，且是唯一出路** |
+| `SERVER`、`UPSTREAM_TIMEOUT`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE`、`MALFORMED_RESPONSE` | 有用 | 有用（实测 503 后 18 秒另一个模型就成功） |
+| `RATE_LIMIT`、`QUOTA` | 等窗口 | 同 provider **多半无用**（实测四个模型 7 秒内一起 429，是账号级的）；跨 provider 才有意义 |
+| `AUTH`、`MISSING_CREDENTIAL`、`NO_ADAPTER` | 无用 | **不换**：provider 与凭据级的原因，同 provider 换模型解决不了 |
+| `INVALID_REQUEST`、`CONTEXT_WINDOW_EXCEEDED` | 无用 | **不换**：请求本身的问题，换模型等于拿它当遮羞布 |
+
+候选全部失败时**仍然判 failed**，但错误里带上整条链：
+`…；已尝试故障转移：OpenAI:gpt-5.6-sol → OpenAI:gpt-6-astra → OpenAI:gpt-5.6-terra`。
+
+边界：同模型重试仍然是**约 1 秒就换**（`MAX_MODEL_RETRIES=2`、`BACKOFF_BASE=0.5` 未改动）——
+恢复快，但一次抖动就会换掉模型；兜底候选里**允许出现更弱的模型**（升档排在前，退一步交付好过判死）。
 
 ### 模型可用性怎么维护（不靠反复烧 token）
 
@@ -396,7 +431,7 @@ def setup(runtime):
 ## 验证
 
 ```bash
-python3 tests/run_all.py                    # 全部套件（当前 302 个用例）
+python3 tests/run_all.py                    # 全部套件（当前 311 个用例）
 python3 tests/run_all.py runtime            # 只跑文件名含 runtime 的
 for f in unison/web/js/*.js; do node --check "$f"; done
 ```

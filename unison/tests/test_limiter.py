@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unison.models import health_verdict
 from unison.limiter import (MAX_MODEL_RETRIES, RETRYABLE_CODES, QueueTimeout, RateLimiter,
                             backoff_seconds, bucket_key, capacity_of)
-from unison.models import Models
+from unison.models import FAILOVER_CODES, Models
 from unison.store import Store
 
 
@@ -311,6 +311,76 @@ class TierDowngradeTests(LimiterHarness):
         big['tier'] = 'light'
         self.store.put('model', big)
         self.assertIsNone(self.models.downgrade_target('probe:big'))   # 记录级声明优先
+
+
+class ModelFailoverTargetTests(LimiterHarness):
+    """故障转移候选：与降档对称，但方向相反——为活下来往上换，而不是为省钱往下换。"""
+
+    def provider(self, names, **extra):
+        record = {'id': 'probe', 'name': 'probe', 'base_url': self.base, 'api': 'openai-completions',
+                  'adapter': 'chat-completions', 'models': [{'id': n} for n in names]}
+        record.update(extra)
+        self.store.put('provider', record)
+        for name in names:
+            self.store.put('model', {'id': f'probe:{name}', 'model': name, 'base_url': self.base,
+                                     'api_key': 'k', 'api': 'openai-completions', 'adapter': 'chat-completions',
+                                     'provider_id': 'probe', 'context_window': 32000, 'max_output': 4096})
+        return record
+
+    def block(self, model_id, code='RATE_LIMIT'):
+        record = self.store.get('model', model_id)
+        record['health'] = {'state': 'blocked', 'code': code, 'checked_at': time.time(), 'expires_at': 0,
+                            'failures': 3, 'history': [], 'source': 'call'}
+        self.store.put('model', record)
+
+    def ids(self, model_id):
+        return [(item['id'], item['source']) for item in self.models.failover_targets(model_id)]
+
+    def test_declared_order_wins_and_can_cross_providers(self):
+        """显式声明的顺序就是优先级；写全 `provider:模型名` 可以换到另一个 provider。"""
+        self.provider(['main', 'backup', 'other'], failover=['backup', 'other'])
+        self.assertEqual(self.ids('probe:main'), [('probe:backup', 'declared'), ('probe:other', 'declared')])
+
+    def test_tier_escalation_goes_up_from_light_to_heavy(self):
+        """你说的"5.4mini 不行就换比他强一点的"：light → standard → heavy，由弱到强。"""
+        self.provider(['small', 'mid', 'big'],
+                      tiers={'light': ['small'], 'standard': ['mid'], 'heavy': ['big']})
+        self.assertEqual(self.ids('probe:small'),
+                         [('probe:mid', 'tier'), ('probe:big', 'tier')])   # 不会往回降到自己
+        # 升档排在前面；升完才是"同 provider 的其他模型"兜底。
+        # 兜底里**允许出现更弱的模型**是有意的：退一步交付好过判死，而换过什么全程有事件可查。
+        self.assertEqual(self.ids('probe:mid'),
+                         [('probe:big', 'tier'), ('probe:small', 'provider')])
+
+    def test_without_any_declaration_falls_back_to_same_provider(self):
+        """没声明 tiers/failover 时不能变成"没有候选"——否则这个机制永远不触发。"""
+        self.provider(['main', 'spare'])
+        self.assertEqual(self.ids('probe:main'), [('probe:spare', 'provider')])
+
+    def test_blocked_and_missing_candidates_are_skipped(self):
+        """宁可不换，也不要静默换成一个同样用不了的模型。"""
+        self.provider(['main', 'dead', 'gone'])
+        self.block('probe:dead', 'AUTH')
+        self.store.db.execute('DELETE FROM records WHERE kind=? AND id=?', ('model', 'probe:gone'))
+        self.assertEqual(self.ids('probe:main'), [])
+
+    def test_model_without_provider_has_no_candidates(self):
+        self.model('solo')
+        self.assertEqual(self.models.failover_targets('probe:solo'), [])
+
+    def test_failover_codes_cover_model_side_failures_only(self):
+        """分流要与 `_VERDICTS` 一致：模型侧的失败才换模型。
+
+        真实事故：gpt-5.4-mini 的 `MODEL_NOT_SUPPORTED`（账户类型不支持）重试永远无用，
+        必须换模型；而 AUTH/MISSING_CREDENTIAL 是 provider 级的，同 provider 换模型解决不了。
+        """
+        self.assertIn('MODEL_NOT_SUPPORTED', FAILOVER_CODES)
+        self.assertIn('MODEL_NOT_FOUND', FAILOVER_CODES)
+        for code in ('SERVER', 'UPSTREAM_TIMEOUT', 'TIMEOUT', 'TRANSPORT', 'EMPTY_RESPONSE'):
+            self.assertIn(code, FAILOVER_CODES)
+        for code in ('AUTH', 'MISSING_CREDENTIAL', 'NO_ADAPTER', 'INVALID_REQUEST',
+                     'CONTEXT_WINDOW_EXCEEDED'):
+            self.assertNotIn(code, FAILOVER_CODES)
 
 
 class RetryableCodeTests(unittest.TestCase):

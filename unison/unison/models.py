@@ -134,6 +134,31 @@ HEALTH_TRANSIENT_LIMIT = 3         # 连续瞬时失败到这个次数才降级�
 _LEGACY_TTL = 3600
 _LEGACY_STALE_ERROR = 6 * 3600   # 旧记录里"参数/权限类"错误多久后视为需要人处理
 
+# **换模型能解决的原因**：这类失败发生在**模型侧**，换一个模型执行同一件事是合理的。
+# 与 `_VERDICTS` 的分流同源，只是问的问题不同——那边问"重试有没有用"，这边问"换模型有没有用"。
+#
+# - 这个模型在本账户下用不了：`MODEL_NOT_SUPPORTED`（实测 gpt-5.4-mini：账户类型不支持）、
+#   `MODEL_NOT_FOUND`。重试永远无用，换模型立刻有用。
+# - 这个模型这次答不了：`SERVER`（实测 gpt-5.6-sol 的 503，提示词安全审计暂时不可用）、
+#   `UPSTREAM_TIMEOUT`、`TIMEOUT`、`TRANSPORT`、`EMPTY_RESPONSE`、`MALFORMED_RESPONSE`。
+# - 额度类 `RATE_LIMIT` / `QUOTA`：同 provider 下常常没用（实测同一网关四个模型 7 秒内
+#   一起 429，那是账号级的），但候选里跨 provider 的模型是有意义的，所以仍然允许换。
+#
+# **不包含** `AUTH` / `MISSING_CREDENTIAL` / `NO_ADAPTER`：那是 provider 与凭据级的原因，
+# 同一个 provider 下换模型解决不了；
+# 也不包含 `INVALID_REQUEST` / `CONTEXT_WINDOW_EXCEEDED`：那是请求本身的问题。
+FAILOVER_CODES = frozenset({
+    'MODEL_NOT_SUPPORTED', 'MODEL_NOT_FOUND',
+    'SERVER', 'UPSTREAM_TIMEOUT', 'TIMEOUT', 'TRANSPORT',
+    'EMPTY_RESPONSE', 'MALFORMED_RESPONSE',
+    'RATE_LIMIT', 'QUOTA',
+})
+
+# 档位由弱到强的顺序：故障转移优先挑"比它强一点"的模型，而不是随便一个。
+# `tiers` 里出现别的名字（例如 cheap/strong）时按 standard 处理——只影响排序，
+# 不影响"能不能用"的判断。
+TIER_RANK = {'light': 0, 'standard': 1, 'heavy': 2}
+
 
 def health_verdict(code):
     return _VERDICTS.get(str(code or 'UNKNOWN'), _VERDICTS['UNKNOWN'])
@@ -598,6 +623,61 @@ class Models:
                 continue
             return candidate
         return None
+
+    def failover_targets(self, model_id):
+        """当前模型用不了或这次答不了时，按顺序可以换上去的模型。
+
+        与 `downgrade_target` 对称，只是方向相反：那边为省钱往下换档，这边为活下来往上换。
+        候选来源按优先级：
+
+        1. **显式声明**：`provider['failover'] = [...]`，顺序即优先级；写全 `provider:模型名`
+           可以跨 provider（同 provider 都答不了时，只有另一个 provider 才有意义）；
+        2. **档位向上**：`tiers` 里比当前档更高的档，由弱到强（light → standard → heavy）；
+        3. **兜底**：同 provider 下**其他**模型，按目录声明顺序。
+
+        底线与 `downgrade_target` 一致：候选必须**存在**、且没有被判定为需要人处理
+        （`HEALTH_BLOCKED`）——宁可不换，也不要静默换成一个同样用不了的模型。
+
+        返回 `[{'id': …, 'source': 'declared'|'tier'|'provider'}]`，顺序即尝试顺序。
+        """
+        try:
+            config = self.store.get('model', model_id)
+        except ValueError:
+            return []
+        provider_id = config.get('provider_id')
+        if not provider_id:
+            return []
+        try:
+            provider = self.store.get('provider', provider_id)
+        except ValueError:
+            return []
+        candidates: list[dict] = []
+
+        def add(name, source):
+            target = str(name or '').strip()
+            if not target:
+                return
+            target = target if ':' in target else f'{provider_id}:{target}'
+            if target == model_id or any(item['id'] == target for item in candidates):
+                return
+            if not self._exists(target):
+                return
+            if self.health_of(self.store.get('model', target))['state'] == HEALTH_BLOCKED:
+                return
+            candidates.append({'id': target, 'source': source})
+
+        for name in (provider.get('failover') or []):
+            add(name, 'declared')
+        tiers = provider.get('tiers') or {}
+        current = TIER_RANK.get(self.tiers_of(config), 1)
+        for name, members in sorted(tiers.items(), key=lambda item: TIER_RANK.get(str(item[0]), 1)):
+            if TIER_RANK.get(str(name), 1) <= current:
+                continue
+            for member in (members or []):
+                add(member, 'tier')
+        for entry in (provider.get('models') or []):
+            add((entry or {}).get('id'), 'provider')
+        return candidates
 
     def _exists(self, model_id):
         return bool(self.store.db.execute('SELECT 1 FROM records WHERE kind=? AND id=?', ('model', model_id)).fetchone())

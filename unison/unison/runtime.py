@@ -8,7 +8,7 @@ import signal
 import time
 from pathlib import Path
 from .store import Store, uid, now, dumps
-from .models import Models, ModelError
+from .models import Models, ModelError, FAILOVER_CODES
 from .workspace import Workspace
 from .image_info import image_info
 from .tools import TOOLS, SYSTEM, schemas_for
@@ -913,16 +913,54 @@ class Runtime:
         room=int(config.get('context_window',32768))-int(config.get('max_output',4096))-2048
         return size>room
 
+    async def _call_model(self,t,history,epoch):
+        """模型调用 + 跨模型故障转移。
+
+        上游异常不该让任务判死：对**模型侧**的失败（这个模型在本账户下用不了、或这次答不了）
+        按 `Models.failover_targets` 的顺序换一个模型执行同一件事。每次尝试都留自己的请求信封
+        与 `ModelCalled`，换的时候写 `ModelFailover`——换过哪个、为什么换、换成了谁，
+        都能从日志逐条复原，**不静默**。
+
+        换成功后**任务继续用新模型**（`model_failover_from` 记住原模型，`model_failover_chain`
+        记住整条链）：否则故障期间每一轮都要先交一次注定失败的调用，每个任务每轮都在烧钱。
+
+        候选全部失败时不再换，也不在这里判死——原样抛出，由调用方按既有语义处理。
+        凭据、参数、上下文超限这类原因不换模型：它们不是模型侧的原因。
+        """
+        candidates=self.models.failover_targets(t['model_id'])
+        while True:
+            header=self.record_request(t,history)
+            self.store.event('ModelCalled',{'model':t['model_id'],'context_epoch':t['context_epoch'],
+                                            'input_ref':header['input_ref'],'request_id':header['id']},task=t)
+            try:
+                return await self.models.call(t['model_id'],history,self.schemas_for_task(t),
+                                              run_id=t['run_id'],task_id=t['id'])
+            except ModelError as error:
+                target=next((item for item in candidates if item['id']!=t['model_id']),None)
+                fresh=self.task(t['id'])
+                if error.code not in FAILOVER_CODES or target is None or fresh['epoch']!=epoch:
+                    tried=list(fresh.get('model_failover_chain') or [])
+                    if tried:
+                        raise ModelError(f'{error}；已尝试故障转移：{" → ".join(tried)} → {fresh["model_id"]}',
+                                         error.code) from None
+                    raise
+                candidates=[item for item in candidates if item['id']!=target['id']]
+                failed=fresh['model_id']
+                t=fresh
+                with self.store.transaction():
+                    t.setdefault('model_failover_from',failed)
+                    t['model_failover_chain']=list(t.get('model_failover_chain') or [])+[failed]
+                    t['model_id']=target['id']
+                    self.store.put('task',t)
+                    self.store.event('ModelFailover',{'from':failed,'to':target['id'],'code':error.code,
+                                                      'source':target['source'],'error':str(error)},t)
+
     async def _model_round(self,t,epoch):
         """调用一次模型并执行它请求的工具批次。返回 True 表示需要在本轮内压缩后继续。"""
         history=self.task_history(t)
         t['last_model_at']=now()
         self.store.put('task',t)
-        header=self.record_request(t,history)
-        self.store.event('ModelCalled',{'model':t['model_id'],'context_epoch':t['context_epoch'],
-                                        'input_ref':header['input_ref'],'request_id':header['id']},task=t)
-        msg,usage=await self.models.call(t['model_id'],history,self.schemas_for_task(t),
-                                            run_id=t['run_id'],task_id=t['id'])
+        msg,usage=await self._call_model(t,history,epoch)
         fresh=self.task(t['id'])
         if fresh['epoch']!=epoch or not self.current(fresh):
             # 暂停中的运行也走这条路（`current()` 为假）：把任务交回队列而不是丢在 running。
