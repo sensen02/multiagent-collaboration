@@ -40,6 +40,7 @@ UNISON_BUILTIN_API_KEY=<your-key> python3 -m unison.server --port 8740
 ```
 
 导入配置时随配置一起提供的 key 优先于这个环境变量。
+**其实我更建议用其他AIagent辅助完成apikey的添加**
 
 ## 验证
 
