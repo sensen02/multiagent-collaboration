@@ -33,6 +33,7 @@ const view = {
   knowledgeQuery: '',
   agentTask: null,
   jumpedQuestions: new Set(),
+  compose: { runId: null, text: '' },
   drawer: null, // { kind: 'task' | 'blob' | 'skill', ... }
   lastArchive: null,
   refreshError: '',
@@ -88,6 +89,71 @@ const openQuestions = () => {
   const run = currentRun();
   return run ? state.questions.filter((question) => question.run_id === run.id && question.status === 'open') : [];
 };
+
+/* -------------------------------------------------------------- 对话输入栏 */
+
+/**
+ * 对话栏发给谁：优先当前选中的 Agent；它若已被"修改目标"弃置（旧版本或 superseded），
+ * 就落到当前版本的主调度——否则消息投进去没有任何东西会被唤醒，用户却以为说上话了。
+ */
+function composeTarget(run, agents) {
+  const list = agents || [];
+  const stale = (agent) => !agent || agent.status === 'cancelled' || agent.superseded === true
+    || (agent.revision !== undefined && run.revision !== undefined && agent.revision !== run.revision);
+  const selected = list.find((agent) => agent.id === view.agentTask) || null;
+  if (!stale(selected)) return { target: selected, fallbackFrom: null };
+  const root = list.find((agent) => !agent.parent_id && !stale(agent)) || null;
+  return { target: root, fallbackFrom: root ? selected : null };
+}
+
+function composeHtml(run, agents) {
+  const { target, fallbackFrom } = composeTarget(run, agents);
+  const draft = view.compose.runId === run.id ? view.compose.text : '';
+  return views.renderComposer({ run, target, fallbackFrom, draft, disabled: run.status === 'cancelled' });
+}
+
+/**
+ * 草稿与焦点必须自己留住：SSE 每次有新事件都会重画整个主区（`host.innerHTML = …`），
+ * 不保的话用户正在打的字会被下一次刷新抹掉，光标也会跳走。
+ */
+function composeFocusSnapshot() {
+  const el = document.activeElement;
+  if (!el || el.tagName !== 'TEXTAREA' || el.form?.dataset?.action !== 'compose') return null;
+  return { start: el.selectionStart, end: el.selectionEnd };
+}
+
+function autoGrowComposer(el) {
+  el.style.height = 'auto';
+  el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+}
+
+function restoreComposer(snapshot) {
+  const el = document.querySelector('form[data-action="compose"] textarea[name="prompt"]');
+  if (!el) return;
+  autoGrowComposer(el);
+  if (!snapshot) return;
+  el.focus();
+  const max = el.value.length;
+  const start = Math.min(snapshot.start ?? max, max);
+  const end = Math.min(snapshot.end ?? start, max);
+  try { el.setSelectionRange(start, end); } catch { /* 未聚焦时部分浏览器拒绝设置选区，忽略即可 */ }
+}
+
+/**
+ * 对话页的聊天区是**自己滚动的**（输入栏固定在它下方），所以整区重画会把滚动位置打回顶部。
+ * 每次重画前记下位置，重画后放回去；原本就贴在底部的人应当继续看到最新一条。
+ */
+function chatScrollSnapshot() {
+  const el = document.querySelector('.chat-scroll');
+  if (!el) return null;
+  return { top: el.scrollTop, atBottom: el.scrollHeight - el.scrollTop - el.clientHeight < 48 };
+}
+
+function restoreChatScroll(snapshot) {
+  const el = document.querySelector('.chat-scroll');
+  if (!el || !snapshot) return;
+  el.scrollTop = snapshot.atBottom ? el.scrollHeight : snapshot.top;
+}
 
 /**
  * 有 Agent 向人类提问时，自动跳到**那个 Agent 的对话页**。
@@ -159,7 +225,7 @@ async function renderMain() {
       }
       counts.chat = openQuestions.length || null;
       body = views.renderAgentTabs({ agents, selected: view.agentTask, questions: data.questions })
-        + views.renderConversation({ run, agent: agents.find((agent) => agent.id === view.agentTask), agents, questions: data.questions, selected: view.agentTask });
+        + views.renderConversation({ run, agent: agents.find((agent) => agent.id === view.agentTask), agents, questions: data.questions, selected: view.agentTask, composer: composeHtml(run, agents) });
     } else if (view.tab === 'overview') {
       const [events, detail] = await Promise.all([
         eventsOf(run.id),
@@ -225,7 +291,9 @@ async function renderMain() {
        <button class="btn sm" data-action="dismiss-archive">知道了</button></div>`
     : '';
 
-  host.innerHTML = `<div class="main-inner">
+  const focusSnapshot = view.tab === 'chat' ? composeFocusSnapshot() : null;
+  const scrollSnapshot = view.tab === 'chat' ? chatScrollSnapshot() : null;
+  host.innerHTML = `<div class="main-inner" data-tab="${attr(view.tab)}">
     ${views.renderRunHeader(run)}
     ${hold}
     ${archiveBanner}
@@ -233,6 +301,10 @@ async function renderMain() {
     ${views.renderTabs(view, counts)}
     <div id="tab-panel" role="tabpanel">${body}</div>
   </div>`;
+  if (view.tab === 'chat') {
+    restoreChatScroll(scrollSnapshot);
+    restoreComposer(focusSnapshot);
+  }
 }
 
 async function refresh() {
@@ -705,11 +777,48 @@ document.addEventListener('submit', (event) => {
     return;
   }
 
+  if (action === 'compose') {
+    const value = form.elements.prompt.value.trim();
+    if (!value) return;
+    const taskId = form.dataset.task;
+    const runId = form.dataset.run;
+    withBusy(form.querySelector('button[type="submit"]'), async () => {
+      const run = state.runs.find((item) => item.id === runId);
+      // 运行被暂停时，光投消息不会唤醒任何东西：先把运行放行，再说这句话。
+      if (run && run.status === 'paused') await api.post('runs/resume', { run_id: runId });
+      await api.post('message', { task_id: taskId, summary: value });
+      view.compose = { runId, text: '' };
+      form.elements.prompt.value = '';
+      invalidate();
+      await refresh();
+      toast('已发送：模型会在当前轮结束后读到这条消息', 'success');
+      restoreComposer({ start: 0, end: 0 });
+    });
+    return;
+  }
+
   if (action === 'knowledge-search') {
     view.knowledgeQuery = form.elements.query.value.trim();
     invalidate(`knowledge:${view.runId}:`);
     renderMain();
   }
+});
+
+document.addEventListener('input', (event) => {
+  const el = event.target;
+  if (el?.name !== 'prompt' || el.form?.dataset?.action !== 'compose') return;
+  view.compose = { runId: el.form.dataset.run || null, text: el.value };
+  autoGrowComposer(el);
+});
+
+document.addEventListener('keydown', (event) => {
+  // Enter 发送、Shift+Enter 换行。`isComposing` / keyCode 229 是中文输入法按回车选词的情况，
+  // 不挡住它的话，用拼音打字的人每选一次词就会误发一条消息。
+  if (event.key !== 'Enter' || event.shiftKey || event.isComposing || event.keyCode === 229) return;
+  const el = event.target;
+  if (el?.name !== 'prompt' || el.form?.dataset?.action !== 'compose') return;
+  event.preventDefault();
+  el.form.requestSubmit();
 });
 
 document.addEventListener('change', (event) => {

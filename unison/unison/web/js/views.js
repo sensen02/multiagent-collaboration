@@ -861,7 +861,7 @@ export function renderHoldBanner({ run, questions, agents, selected }) {
 }
 
 /** 单个 Agent 的完整对话页。 */
-export function renderConversation({ run, agent, agents, questions, selected }) {
+export function renderConversation({ run, agent, agents, questions, selected, composer = '' }) {
   if (!agent) {
     return `<div class="card"><div class="empty"><h3>这个运行还没有可显示的 Agent</h3><p>创建任务后，主调度 Agent 的对话会出现在这里。</p></div></div>`;
   }
@@ -903,6 +903,7 @@ export function renderConversation({ run, agent, agents, questions, selected }) 
   const errorNote = agent.error ? `<div class="banner error"><div class="banner-main"><h4>这个 Agent 出错了</h4><div class="banner-body">${esc(agent.error)}</div></div></div>` : '';
 
   return `<div class="chat">
+    <div class="chat-scroll">
     <div class="chat-head">
       <span class="agent-avatar lg" data-role="${role}">${role === 'root' ? '主' : '子'}</span>
       <div class="chat-ident">
@@ -922,7 +923,70 @@ export function renderConversation({ run, agent, agents, questions, selected }) 
       </div>`).join('')}</div>` : ''}
     ${truncated}
     ${report}
+    </div>
+    ${composer}
   </div>`;
+}
+
+/**
+ * 对话输入栏：控制台里"给正在跑的系统补一句话"的入口。
+ *
+ * 它不引入任何新机制，只是把已有的消息协议摆到台面上：
+ * `POST /api/message` → `deliver(delivery='wake')` → 消息进收件箱，
+ * 当前这一轮（模型回复 + 它请求的工具批次）结束后被读到；等待中的任务立刻被唤醒；
+ * 已交付但属于当前版本的任务会被重新排队继续同一条对话（不新建版本、不丢历史）。
+ *
+ * 因此"发送后什么时候被模型看到"是有确定答案的，hint 必须如实写出来——
+ * 这一栏存在的意义就是替掉"只能靠「修改目标」才说得上话"。
+ */
+export function renderComposer({ run, target, fallbackFrom = null, draft = '', disabled = false }) {
+  if (!run) return '';
+  if (!target) {
+    return `<div class="composer" role="group" aria-label="对话">
+      <div class="composer-note warn">这个运行现在没有可接收消息的任务：任务都已结束、已取消，或只剩下旧目标版本的任务。用「修改目标」开新版本，或先「继续运行」。</div>
+    </div>`;
+  }
+  const role = target.parent_id ? 'child' : 'root';
+  const unread = (target.unread || []).length;
+  const fallbackNote = fallbackFrom
+    ? `<div class="composer-note">选中的 <span class="mono">${esc(fallbackFrom.id)}</span>（r${esc(fallbackFrom.revision ?? '?')}）已被目标切换弃置，发过去不会唤醒它；这条会发给当前版本的${role === 'root' ? '主调度' : '子 AGENT'}。</div>`
+    : '';
+  const meta = [
+    `<span class="agent-avatar" data-role="${role}">${role === 'root' ? '主' : '子'}</span>`,
+    `<span class="composer-who">发给${role === 'root' ? '主调度' : '子 AGENT'} <span class="mono tiny">${esc(target.id)}</span></span>`,
+    target.model_id ? quietPill(target.model_id) : '',
+    pill(target.status),
+    unread ? `<span class="tiny muted">${unread} 条未读</span>` : '',
+  ].filter(Boolean).join('');
+  return `<form class="composer" data-action="compose" data-task="${attr(target.id)}" data-run="${attr(run.id)}">
+    <div class="composer-head">${meta}</div>
+    ${fallbackNote}
+    <div class="composer-row">
+      <textarea name="prompt" rows="1" ${disabled ? 'disabled' : ''}
+        placeholder="${disabled ? '这个运行已取消，无法再交互' : '给这个 Agent 补一句话：新约束、纠正、放行……（Enter 发送，Shift+Enter 换行）'}"
+        aria-label="发给该 Agent 的消息">${esc(draft)}</textarea>
+      <button class="btn primary" type="submit" ${disabled ? 'disabled' : ''}>发送</button>
+    </div>
+    <div class="composer-hint tiny muted">${esc(composeHint(run, target))}</div>
+  </form>`;
+}
+
+/** 把"这条消息什么时候会被模型读到"如实说清楚，而不是让人猜。 */
+function composeHint(run, target) {
+  if (run.status === 'cancelled') return '这个运行已取消：消息只会被记录，不会唤醒任何任务。';
+  if (run.status === 'paused') {
+    return run.pause_reason === 'human_question'
+      ? '运行已暂停（在等人类回答）：发送会先恢复运行，模型在下一轮读到这条消息；未答的问题仍需要你回答或放行。'
+      : '运行被手动暂停：发送会先恢复运行，模型在下一轮读到这条消息。';
+  }
+  switch (target.status) {
+    case 'running': return '它正在跑这一轮：消息先入收件箱，等这一轮的模型回复与工具批次结束后被读到。';
+    case 'waiting': return '它正卡在等待上：发送会立刻唤醒它，不再等原来的条件。';
+    case 'queued': return '它在队列里：下一轮开始时读到这条消息。';
+    case 'completed': return '它已交付过：发送会把它重新排队，在同一条对话里继续（不新建版本、不丢历史）。';
+    case 'failed': return '它上次失败了：发送会先按「继续任务」恢复它，再投这条消息。';
+    default: return '发送后模型会在本轮结束后读到这条消息。';
+  }
 }
 
 function renderBlock(block) {

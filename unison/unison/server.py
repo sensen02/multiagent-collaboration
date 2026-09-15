@@ -239,6 +239,8 @@ class App:
                 agents.append({
                     'id':t['id'],'goal':t.get('goal'),'parent_id':t.get('parent_id'),'model_id':t.get('model_id'),
                     'status':t.get('status'),'revision':t.get('revision'),'created':t.get('created'),
+                    # 控制台要区分"这个任务还活着"与"它已被目标切换弃置"：后者发消息不会唤醒它。
+                    'superseded':bool(t.get('superseded')),
                     'priority':t.get('priority'),'workspace':t.get('workspace'),'project_root':t.get('project_root'),
                     'wait':t.get('wait'),'error':t.get('error'),'result':t.get('result'),
                     'last_model_at':t.get('last_model_at'),'terminal_seq':t.get('terminal_seq'),

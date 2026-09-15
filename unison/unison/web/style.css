@@ -700,6 +700,51 @@ details.raw > summary:hover { color: var(--c-text-2); }
 .chat-answered .qa { font-size: var(--fs-12); color: var(--c-text-2); margin-bottom: var(--sp-2); }
 .chat-answered .a-text { color: var(--c-text); margin-top: 3px; }
 
+/* 对话输入栏：控制台里"给正在跑的系统补一句话"的入口。
+   它不能靠 `position: sticky` —— sticky 会被包含块卡住（元素是最后一个子节点时没有可上移的余量，
+   会话滚到顶部时输入栏就掉到视野外）。这里改用与 DSH 同构的结构：对话页是一列 flex，
+   **聊天区自己滚动**（.chat-scroll），输入栏作为不收缩的末项固定在下方，任何滚动位置都可见。 */
+.main-inner[data-tab="chat"] {
+  height: 100%; display: flex; flex-direction: column;
+  padding-bottom: var(--sp-4);      /* 输入栏自己就是页脚，不再需要 96px 的滚动留白 */
+}
+.main-inner[data-tab="chat"] #tab-panel {
+  flex: 1 1 auto; min-height: 320px;      /* 上方 chrome（目标、提问横幅）太高时不再硬挤，整页可滚 */
+  display: flex; flex-direction: column; overflow-y: auto;
+}
+.main-inner[data-tab="chat"] .agent-tabs { flex: none; }
+.main-inner[data-tab="chat"] .chat { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.chat-scroll { flex: 1; min-height: 0; overflow-y: auto; overscroll-behavior: contain; }
+.chat-scroll:focus-visible { outline: none; }
+
+.composer {
+  flex: none; z-index: 12;
+  display: flex; flex-direction: column; gap: var(--sp-2);
+  margin-top: var(--sp-3); padding: var(--sp-3);
+  border: 1px solid var(--c-line-2); border-radius: var(--r-lg);
+  background: var(--c-bg-raised);
+  box-shadow: var(--shadow-1);
+}
+.composer:focus-within { border-color: var(--c-accent-line); box-shadow: 0 0 0 3px var(--c-accent-soft); }
+.composer-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--sp-2); }
+.composer-who { font-size: var(--fs-12); color: var(--c-text-2); }
+.composer-note {
+  font-size: var(--fs-11); line-height: var(--lh-12); color: var(--c-text-3);
+  background: var(--c-bg-sunken); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+}
+.composer-note.warn { color: var(--c-warn); background: var(--c-warn-soft); }
+.composer-row { display: flex; gap: var(--sp-2); align-items: flex-end; }
+.composer-row textarea {
+  flex: 1; min-width: 0; min-height: 34px; max-height: 200px; resize: none; overflow-y: auto;
+  padding: 7px var(--sp-3); border: 1px solid var(--c-line-2); border-radius: var(--r-sm);
+  background: var(--c-bg); color: var(--c-text);
+  font-family: var(--font-sans); font-size: var(--fs-13); line-height: var(--lh-13);
+}
+.composer-row textarea:focus { outline: none; border-color: var(--c-accent); }
+.composer-row textarea:disabled { background: var(--c-bg-sunken); color: var(--c-text-4); }
+.composer-row .btn { height: 34px; padding: 0 var(--sp-4); flex: none; }
+.composer-hint { padding-left: 2px; }
+
 .msg { display: grid; grid-template-columns: 26px 1fr; gap: var(--sp-3); }
 .msg-avatar {
   width: 26px; height: 26px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
@@ -787,6 +832,9 @@ details.raw > summary:hover { color: var(--c-text-2); }
 @media (max-width: 640px) {
   .topbar-mid { display: none; }
   .topbar-end .conn { display: none; }
+  /* 窄屏纵向空间宝贵：输入栏只留"发给谁"这一行必要信息，任务 id 与模型徽章省掉。 */
+  .composer-who .mono, .composer-head .pill { display: none; }
+  .composer { padding: var(--sp-2) var(--sp-3); }
   .run-actions { flex-wrap: wrap; }
   .grid.cols-2, .grid.cols-3, .grid.cols-4 { grid-template-columns: 1fr 1fr; }
   .field-row, .config-summary-grid { grid-template-columns: 1fr; }

@@ -8,6 +8,8 @@ version = "0.1.0"
 description = "Local event-driven multi-model collaboration"
 requires-python = ">=3.11"
 dependencies = []
+# Unlicense：公共领域奉献，零条件（见仓库根 LICENSE）。
+license = {text = "Unlicense"}
 
 [project.scripts]
 unison = "unison.server:main"

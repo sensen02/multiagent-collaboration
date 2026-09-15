@@ -18,6 +18,9 @@ benchmarks/*/runs/*
 papers/
 repositories/
 
+# 本机运行日志（例如把服务输出重定向到 unison/server.log）
+*.log
+
 # Python
 __pycache__/
 *.py[cod]
