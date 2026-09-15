@@ -714,8 +714,24 @@ details.raw > summary:hover { color: var(--c-text-2); }
   margin: var(--sp-3) 0 var(--sp-4); padding: var(--sp-3) var(--sp-4);
   border-left: 2px solid var(--c-accent-line); background: var(--c-bg-sub);
   border-radius: 0 var(--r-md) var(--r-md) 0;
-  font-size: var(--fs-13); line-height: var(--lh-13); color: var(--c-text); white-space: pre-wrap;
+  font-size: var(--fs-13); line-height: var(--lh-13); color: var(--c-text);
 }
+.chat-goal-text { white-space: pre-wrap; }
+
+/* 主目标折叠（见 app.js `setupChatGoal`）。
+   目标长的时候它一个人就能占满整个对话视口——实测某个 1060 字的目标渲染成 524px，
+   而对话区视口只有 435px，于是**整屏只有目标，一句对话都看不到**。
+   判据是测量出来的（超过 3 行才算长），短目标不会进入这个状态，也不会多出任何按钮。
+   折叠后只显示 2 行：`-webkit-line-clamp` 会自带省略号，比 max-height 截断诚实。 */
+.chat-goal.is-collapsed .chat-goal-text {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.chat-goal-more {
+  margin-top: var(--sp-2); padding: 2px var(--sp-2); cursor: pointer;
+  border: 1px solid var(--c-line-3); border-radius: var(--r-sm); background: var(--c-bg-raised);
+  font: inherit; font-size: var(--fs-11); line-height: var(--lh-11); color: var(--c-text-2);
+}
+.chat-goal-more:hover { background: var(--c-bg-hover); color: var(--c-text); }
 .chat-log { display: flex; flex-direction: column; gap: var(--sp-4); margin-top: var(--sp-4); }
 .chat-answered { margin-top: var(--sp-5); border-top: 1px solid var(--c-line-1); padding-top: var(--sp-3); }
 .chat-answered h4 { font-size: var(--fs-12); color: var(--c-text-3); margin-bottom: var(--sp-2); }

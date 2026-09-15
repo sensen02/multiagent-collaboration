@@ -935,7 +935,10 @@ export function renderConversation({ run, agent, agents, questions, selected, co
         <div class="chat-meta">${meta}</div>
       </div>
     </div>
-    <div class="chat-goal">${esc(agent.goal || '')}</div>
+    <div class="chat-goal">
+      <div class="chat-goal-text">${esc(agent.goal || '')}</div>
+      <button class="chat-goal-more" type="button" data-action="goal-toggle" hidden>展开目标</button>
+    </div>
     ${unread ? `<div class="note tiny">还有 ${unread} 条消息没被这个 Agent 读到（下一轮会读到）。</div>` : ''}
     ${waitNote}
     ${errorNote}

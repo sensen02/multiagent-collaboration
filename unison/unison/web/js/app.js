@@ -189,6 +189,116 @@ function restoreChatScroll(snapshot) {
 }
 
 /**
+ * 主目标折叠：目标长的时候它一个人就占满整个对话视口。
+ *
+ * 真机测量（`run_1da778c90c48` 的根任务目标，1060 字）：渲染成 **524px = 26 行**，
+ * 而 `.chat-scroll` 的视口只有 435px——于是整屏只有目标，`.chat-log` 从 y=935 开始，
+ * 一句对话都看不到。
+ *
+ * 三条规则：
+ *
+ * 1. **判据是测量出来的，不是字数**：超过 `GOAL_SHORT_LINES` 行才算"长"，折叠后显示
+ *    `GOAL_COLLAPSED_LINES` 行。短目标不进这个状态，也不多出任何按钮（少一个可以困惑的地方）。
+ * 2. **往下滑自动折叠，滑回顶部自动展开**。这是用户明确要的：目标不该永远占着屏幕，
+ *    但"我到底在做什么任务"要能一眼看回来。
+ * 3. **折叠/展开时补偿 `scrollTop`**（按被收起的高度），正在看的内容不会跳；
+ *    展开发生在顶部时直接回到 0，让目标从头显示。
+ *
+ * 两个阈值分开（72 / 8）是有意的**迟滞**：折叠会减少内容高度，如果折叠与展开用同一个阈值，
+ * 折叠把 scrollTop 拉到阈值以下就会立刻自我展开，来回抖动。
+ * 手动点「展开目标」后 `manual` 置位，不再自动折叠，直到用户自己滑回顶部。
+ *
+ * 状态存在模块级变量里而不是 DOM 上：SSE 每有新事件就整区重画，DOM 上的状态活不过一次刷新。
+ */
+const GOAL_SHORT_LINES = 3;
+const GOAL_COLLAPSED_LINES = 2;
+const GOAL_COLLAPSE_AT = 72;
+const GOAL_EXPAND_AT = 8;
+const goalState = { taskId: null, collapsed: false, manual: false };
+
+function goalElements() {
+  return {
+    goal: document.querySelector('.chat-goal'),
+    text: document.querySelector('.chat-goal-text'),
+    more: document.querySelector('.chat-goal-more'),
+    scroller: document.querySelector('.chat-scroll'),
+  };
+}
+
+function applyGoalCollapsed(collapsed) {
+  const { goal, more } = goalElements();
+  if (!goal) return 0;
+  const before = goal.getBoundingClientRect().height;
+  goalState.collapsed = collapsed;
+  goal.classList.toggle('is-collapsed', collapsed);
+  if (more) more.hidden = !collapsed;
+  return before - goal.getBoundingClientRect().height;   // 被收起的高度
+}
+
+function onGoalScroll() {
+  const { goal, scroller } = goalElements();
+  if (!goal || !scroller || goal.dataset.long !== 'yes') return;
+  const top = scroller.scrollTop;
+  if (top <= GOAL_EXPAND_AT) {
+    goalState.manual = false;
+    if (goalState.collapsed) {
+      applyGoalCollapsed(false);
+      scroller.scrollTop = 0;
+    }
+    return;
+  }
+  if (goalState.manual || goalState.collapsed || top <= GOAL_COLLAPSE_AT) return;
+  const saved = applyGoalCollapsed(true);
+  if (saved > 0) scroller.scrollTop = Math.max(GOAL_EXPAND_AT + 1, top - saved);
+}
+
+/**
+ * 重画后重建目标折叠状态。
+ *
+ * 必须在 `restoreChatScroll()` **之前**调用：这里只按记住的状态套类、不做滚动补偿，
+ * 让 `restoreChatScroll` 面对的是最终布局（否则每次 SSE 刷新都会因为高度变化跳一下）。
+ * "长不长"要在这时候量——此刻元素是全新的、还没套过折叠类，`scrollHeight` 是完整内容高度。
+ *
+ * `entering` 表示"刚切进对话页"（没有滚动快照，接下来一定停在顶部）。这时清掉折叠状态，
+ * 与"滑到顶就展开"保持一致——否则会出现"人在顶部、目标却收着"这种自相矛盾的画面。
+ */
+function setupChatGoal(entering = false) {
+  const { goal, text, scroller } = goalElements();
+  if (!goal || !text || !scroller) return;
+  const key = view.agentTask || 'root';
+  if (goalState.taskId !== key || entering) {
+    goalState.taskId = key;
+    goalState.collapsed = false;
+    goalState.manual = false;
+  }
+  const line = parseFloat(getComputedStyle(text).lineHeight) || 20;
+  goal.dataset.long = text.scrollHeight > line * GOAL_SHORT_LINES + 1 ? 'yes' : 'no';
+  if (goal.dataset.long !== 'yes') {
+    goalState.collapsed = false;
+    goal.classList.remove('is-collapsed');
+    return;
+  }
+  applyGoalCollapsed(goalState.collapsed);
+}
+
+// 滚动监听挂在 document 上、用捕获阶段：滚动事件不冒泡，但捕获阶段能拿到**任意**容器的滚动，
+// 因此不必每次重画都往新元素上重挂一次。代价是回调会在任何滚动里跑，所以它第一件事就是确认
+// 目标块存在且确实"长"——短目标、别的标签页、别的滚动都直接返回。
+document.addEventListener('scroll', onGoalScroll, { capture: true, passive: true });
+
+/**
+ * 手动展开（点「展开目标」）。只做展开这一个方向：自动折叠仍然归滚动管，
+ * 所以不会出现"按钮说收起、滚动说展开"互相打架的状态。
+ */
+function expandChatGoal() {
+  const { scroller } = goalElements();
+  if (!goalState.collapsed) return;
+  const saved = applyGoalCollapsed(false);
+  goalState.manual = true;
+  if (scroller && saved < 0) scroller.scrollTop -= saved;   // 内容在上方长高了，补回去
+}
+
+/**
  * 有 Agent 向人类提问时，自动跳到**那个 Agent 的对话页**。
  *
  * 为什么值得自动跳：提问会让整个运行停住（`human_ask` = 全体暂停），
@@ -354,6 +464,7 @@ async function renderMain() {
     <div id="tab-panel" role="tabpanel">${body}</div>
   </div>`;
   if (view.tab === 'chat') {
+    setupChatGoal(!scrollSnapshot);   // 先定布局（只套类、不滚动），再恢复滚动位置
     restoreChatScroll(scrollSnapshot);
     restoreComposer(focusSnapshot);
   }
@@ -553,6 +664,8 @@ const actions = {
   'open-task': (el) => openTask(el.dataset.task),
 
   'close-drawer': () => closeDrawer(),
+
+  'goal-toggle': () => expandChatGoal(),
 
   'answer': (el) => withBusy(el, async () => {
     await api.post('answer', { id: el.dataset.question, answer: el.dataset.answer });
