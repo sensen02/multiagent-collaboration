@@ -257,6 +257,16 @@ Unison 的服务监听 `127.0.0.1`，控制台和外部程序使用同一组端�
 ### POST /api/message · /api/resume · /api/answer · /api/task/cancel · /api/runs/pause · /api/runs/resume · /api/revise · /api/archive · /api/restore · /api/compact
 分别用于：给任务发消息并唤醒、恢复失败任务、回答问题、取消任务子树、暂停/继续派发、切换目标版本、归档、从归档恢复到新目录、请求压缩上下文。参数与 `unison/server.py` 的 `dispatch()` 一致。
 
+**`POST /api/archive {"run_id": …}` 是结案，不是打包。** 它只在该运行处于**已完成 / 已停止 / 主调度模型报错**（根任务 `failed`）时受理，否则返回 `400 invalid_request` 并说明"请先停止或等它结束"。受理后依次：停掉该 run 的所有非终态任务与它们派生的进程组、把事件/报告/知识/文件版本/内容对象写进 `<数据目录>/archives/*.tar.gz`（先留退路）、删除 `<数据目录>/workspaces/<task_id>` 子任务副本、保留全部 `file` 修改记录与内容对象，最后给 run 打 `archived` 并写 `RunArchived` 事件。响应：
+
+```json
+{"run_id":"run_…","archive_path":"…/archives/run_…-r1-….tar.gz",
+ "stopped":["task_…"],"released":[{"task_id":"task_…","path":"…","bytes":40754674}],
+ "freed_bytes":40754674,"files_kept":146}
+```
+
+归档之后该运行**不再继续**：`/api/revise`、`/api/resume`、`/api/runs/resume`、`/api/message`（唤醒）、以及给它的任务再建子任务，都会返回 `400` 并附带"运行已归档（结案），不再继续"。重复归档同样被拒。要接着做请新建运行。
+
 注意 `POST /api/answer` 不只唤醒提问的那个任务：任何 Agent 调用 `human_ask` 都会**暂停整个运行**（`run.status="paused"`、`run.pause_reason="human_question"`），外部程序从 `/api/wait` 看到 `waiting` 或从 `/api/transcript` 看到 `hold.paused` 时，应当把它理解为"全体已停手，等这一句回答"；回答后运行自动回到 `active`。若该运行下还有其它未答问题，则继续停着。
 
 ## 4. 端到端示例

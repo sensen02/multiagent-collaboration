@@ -102,6 +102,10 @@ class Workspace:
             if modes and rel in modes: f.chmod(modes[rel])
 
     def reconcile(self, task, actor='external/unknown', call_id=None):
+        # 副本已经被归档释放：目录不再存在是**我们自己**造成的，不是"文件被删了"。
+        # 少了这一条，被收掉的任务在收尾时（工具的 finally 里还会对账一次）会把整份
+        # 副本记成一批删除记录，而那些删除从未发生过——文件修改记录必须是真的。
+        if task.get('workspace_released'): return []
         current, omissions, stats = self.scan(task['workspace'],task.get('file_stats'),with_stats=True)
         old = task.get('manifest',{})
         modes=self.file_modes(task['workspace'],current)
@@ -326,6 +330,38 @@ class Workspace:
                 for h in sorted(objects): tar.add(self.store.objects/h,arcname='objects/'+h)
         self.store.event('SnapshotArchived',{'path':str(destination)},run_id=run['id'],revision=run['revision'])
         return {'path':str(destination)}
+
+
+    def release(self, tasks):
+        """释放子任务工作区副本，返回实际删掉的清单与字节数。
+
+        归档之所以能真正省下磁盘，靠的是这一步：`setup()` 给每个子任务建的副本
+        `<数据目录>/workspaces/<task_id>` 会一直留在磁盘上，运行结束后再没人用它。
+
+        边界写死在代码里，不做推断：
+        - 只删**数据目录工作区根**下面的目录，且目录名必须等于任务 id；
+        - 根任务直接操作用户的项目目录，永远不在释放范围内；
+        - 文件修改记录不在这里——`file` 记录、内容对象、报告都在库里，删副本不会动它们，
+          因此"谁在什么时候把哪个文件改成了什么"照旧可查，`workspace_diff` 也能重建差异。
+        """
+        root=(self.store.root/'workspaces').resolve()
+        released=[]
+        for task in tasks:
+            value=task.get('workspace')
+            if not value: continue
+            resolved=Path(value).expanduser().resolve()
+            if resolved==root or not resolved.is_relative_to(root): continue
+            if resolved.name!=task['id'] or not resolved.is_dir(): continue
+            bytes_=sum(f.stat().st_size for f in resolved.rglob('*') if f.is_file())
+            shutil.rmtree(resolved)
+            # 与删除同一笔写下标记：此后这个任务的任何一次对账都不再把"目录不存在"
+            # 当成"文件被删除"（见 reconcile 开头）。被杀掉的任务可能还在收尾。
+            # 重新读一次再写，避免用调用方手里的旧副本覆盖掉并发更新。
+            fresh=self.store.get('task',task['id'])
+            fresh['workspace_released']=now()
+            self.store.put('task',fresh)
+            released.append({'task_id':task['id'],'path':str(resolved),'bytes':bytes_})
+        return released
 
 
     def restore_archive(self, archive_path, task_id=None, version='after'):

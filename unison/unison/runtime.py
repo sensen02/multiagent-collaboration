@@ -432,6 +432,7 @@ class Runtime:
 
     def create_task(self, run, goal, model_id, parent=None, dependencies=None, priority=0):
         self.store.get('model',model_id)
+        self.ensure_not_archived(run)
         deps = dependencies or []
         for id in deps:
             d = self.task(id)
@@ -600,6 +601,11 @@ class Runtime:
           通知的语义是"这件事结束了"，它必须自己也结束。
         """
         t=self.task(task_id)
+        # 归档即结案：`wake` 会把一个已完成的任务重新排队、并把 run 拉回 active，
+        # 那正是"归档后又被叫起来"，而它的工作区副本已经释放了。消息照旧入库留痕，
+        # 但不唤醒。
+        if delivery=='wake' and self.run(t['run_id']).get('archived'):
+            raise ValueError('运行已归档（结案），不再唤醒它的任务；需要接着做请新建任务')
         dedup_key={'from_task':sender,'task_id':task_id,'kind':kind,'summary':summary}
         # 按内容压制"同一句话又发了一遍"的做法已移除：两次内容相同的消息可能是两次真实意图
         # （催促、重发、确认），判断它们是不是同一件事属于语义判断。去重只保留 message_id
@@ -1329,8 +1335,76 @@ class Runtime:
             # 取消掉提问题的那个人之后，这个问题永远不会被回答了：别让整个运行陪着一起停。
             self.release_human_pause(t['run_id'])
 
-    def revise(self,run_id,goal):
+    # 归档门禁：归档是**结案**，不是打包备份——它会停掉这个运行的一切并释放子任务
+    # 工作区副本，所以只允许在"这个运行真的停下来了"之后执行。
+    ARCHIVABLE_STATES = {'completed','cancelled'}
+
+    def ensure_not_archived(self,run):
+        """归档即结案：不再接受新任务、目标变更、回答与恢复。
+
+        释放副本之后继续跑是危险的——子任务的工作区已经不在磁盘上了，
+        与其让它带着一个空目录继续，不如把话说明白。
+        """
+        if run.get('archived'):
+            raise ValueError('运行已归档（结案），不再继续；需要接着做请新建任务')
+        return run
+
+    def run_archivable(self,run):
+        """能不能归档：返回 (是否允许, 不允许的原因)。"""
+        if run.get('archived'): return False,'这个运行已经归档过了'
+        if run['status'] in self.ARCHIVABLE_STATES: return True,''
+        # 主调度模型报错：根任务已 failed，不会再有新调度了，这也是一个可以结案的终态。
+        root=self.task(run['root_task']) if run.get('root_task') else None
+        if root is not None and root['status']=='failed': return True,''
+        return False,('运行还在进行中（%s）：归档会停掉它的全部 AI 与派生进程并释放工作区副本，'
+                      '请先停止它或等它结束' % run['status'])
+
+    def archive_run(self,run_id):
+        """归档 = 结案，而不是"再存一份"。
+
+        五件事，顺序是有意的：
+        1. **门禁**：只有已完成 / 已停止 / 主调度模型报错时才允许（见 `run_archivable`）；
+        2. **停掉这个运行的一切**：非终态任务一律 `cancel_task`（它会 SIGKILL 该任务派生的
+           进程组），终态任务残留的进程也一并收掉；
+        3. **落一份冷备**：`workspace.archive` 先把事件、报告、知识、文件版本与内容对象写进
+           tar，因此 `restore_archive` 随时能解到新目录——释放副本之前先有退路；
+        4. **释放子任务工作区副本**：删掉 `<数据目录>/workspaces/<task_id>`，磁盘真正回收；
+        5. **保留文件修改记录**：`file` 记录、内容对象、报告、事件都不动，"谁在什么时候把哪个
+           文件改成了什么"照旧可查，`workspace_diff` 仍能重建差异。
+
+        最后给 run 打上 `archived`，控制台据此把它从活动列表移到"已归档会话"。
+        """
         run=self.run(run_id)
+        ok,reason=self.run_archivable(run)
+        if not ok: raise ValueError(reason)
+        tasks=[t for t in self.store.all('task') if t['run_id']==run_id]
+        stopped=[]
+        for task in tasks:
+            if task['status'] in TERMINAL:
+                self.interrupt(task['id'])   # 终态任务也可能残留进程
+                continue
+            self.cancel_task(task['id'])
+            stopped.append(task['id'])
+        snapshot=self.workspace.archive(run)     # 先留退路，再释放
+        released=self.workspace.release(tasks)
+        freed=sum(item['bytes'] for item in released)
+        files_kept=len([x for x in self.store.all('file') if x['run_id']==run_id])
+        with self.store.transaction():
+            fresh=self.run(run_id)
+            fresh['archived']=now()
+            fresh['archive_path']=snapshot['path']
+            fresh['archived_stopped']=stopped
+            fresh['archived_released']=released
+            self.store.put('run',fresh)
+            self.store.event('RunArchived',{'archive':snapshot['path'],'stopped':stopped,
+                                            'released':[item['task_id'] for item in released],
+                                            'freed_bytes':freed,'files_kept':files_kept},
+                             run_id=run_id,revision=fresh['revision'])
+        return {'run_id':run_id,'archive_path':snapshot['path'],'stopped':stopped,
+                'released':released,'freed_bytes':freed,'files_kept':files_kept}
+
+    def revise(self,run_id,goal):
+        run=self.ensure_not_archived(self.run(run_id))
         self.check_workspace_available(run['workspace'],run_id)
         if not goal.strip(): raise ValueError('新目标不能为空')
         previous=run['revision']
@@ -1356,7 +1430,7 @@ class Runtime:
 
     def answer(self,id,answer):
         q=self.store.get('question',id); t=self.task(q['task_id'])
-        run=self.run(t['run_id'])
+        run=self.ensure_not_archived(self.run(t['run_id']))
         if q['status']!='open' or t['revision']!=run['revision'] or t['status'] in TERMINAL or run['status']=='cancelled': raise ValueError('问题已回答或属于旧目标')
         with self.store.transaction():
             q.update(status='answered',answer=answer); self.store.put('question',q)
@@ -1368,7 +1442,7 @@ class Runtime:
         return q
 
     def resume(self,id,message='继续执行；请先检查已保存的状态。'):
-        t=self.task(id); run=self.run(t['run_id'])
+        t=self.task(id); run=self.ensure_not_archived(self.run(t['run_id']))
         if t['revision']!=run['revision'] or t['status'] in {'cancelled','superseded'}: raise ValueError('已弃置或取消的任务不能恢复，请创建新任务')
         self.check_workspace_available(run['workspace'],run['id'])
         with self.store.transaction():
@@ -1430,7 +1504,7 @@ class Runtime:
         return True
 
     def resume_run(self,id):
-        run=self.run(id)
+        run=self.ensure_not_archived(self.run(id))
         if run['status']=='active':
             return run
         if run['status']!='paused':

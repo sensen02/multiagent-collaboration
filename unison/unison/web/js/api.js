@@ -67,7 +67,8 @@ export function createClient({ timeout = DEFAULT_TIMEOUT } = {}) {
   return {
     request,
     get: (path, query, signal) => request(path, { query, signal }),
-    post: (path, body) => request(path, { method: 'POST', body: body ?? {}, timeoutMs: 120000 }),
+    // POST 默认 120 秒；归档这类真要干活的动作由调用方给更长的窗口（服务端窗口 300 秒）。
+    post: (path, body, options) => request(path, { method: 'POST', body: body ?? {}, timeoutMs: 120000, ...options }),
   };
 }
 

@@ -22,10 +22,7 @@ export function renderFilters(runs, activeFilter) {
   }).join('');
 }
 
-export function renderRunList(runs, { selected, questions }) {
-  if (!runs.length) {
-    return `<div class="empty" style="padding:32px 8px"><p>没有匹配的任务</p></div>`;
-  }
+function runItems(runs, { selected, questions, archived = false }) {
   const openByRun = new Map();
   for (const question of questions) {
     if (question.status !== 'open') continue;
@@ -35,18 +32,45 @@ export function renderRunList(runs, { selected, questions }) {
     .map((run) => {
       const meta = statusOf(run.status);
       const open = openByRun.get(run.id) || 0;
+      const when = archived && run.archived ? `归档于 ${relative(run.archived)}` : relative(run.created);
       return `<button class="run-item" data-action="select-run" data-run="${attr(run.id)}" aria-current="${run.id === selected}">
         <span class="run-goal">${esc(run.goal)}</span>
         <span class="run-meta">
           <span class="pill st-${esc(meta.tone)}" style="height:18px;padding:0 6px"><i class="dot"></i>${esc(meta.label)}</span>
           <span>r${esc(run.revision)}</span>
           <span class="sep">·</span>
-          <span>${esc(relative(run.created))}</span>
+          <span>${esc(when)}</span>
           ${open ? `<span class="pill st-waiting" style="height:18px;padding:0 6px">${open} 待答</span>` : ''}
         </span>
       </button>`;
     })
     .join('');
+}
+
+export function renderRunList(runs, { selected, questions }) {
+  if (!runs.length) {
+    return `<div class="empty" style="padding:32px 8px"><p>没有匹配的任务</p></div>`;
+  }
+  return runItems(runs, { selected, questions });
+}
+
+/** 已归档会话：结案的运行不删记录，只是从活动列表挪进这个默认折叠的分区。
+ *
+ * 归档意味着运行已经停下、子任务工作区副本已经释放，但事件、报告与**文件修改记录**
+ * 都还在，所以这里列出的每一条都仍然点得开、查得到——它是一份记录，不是一个删除。
+ * 默认折叠：这个分区的用处是"要找的时候能找到"，而不是天天占着视线。
+ */
+export function renderArchivedList(runs, { selected, questions, open = false }) {
+  const head = `<button class="run-group-head" data-action="toggle-archived" aria-expanded="${open}">
+      <span class="chev" aria-hidden="true">${open ? '▾' : '▸'}</span>
+      <span class="run-group-title">已归档会话</span>
+      <span class="count">${runs.length}</span>
+    </button>`;
+  if (!open) return `<div class="run-group">${head}</div>`;
+  const body = runs.length
+    ? runItems(runs, { selected, questions, archived: true })
+    : `<div class="empty" style="padding:12px 8px"><p>还没有归档的会话</p></div>`;
+  return `<div class="run-group">${head}<div class="run-group-body">${body}</div></div>`;
 }
 
 export function renderSidebarFoot(state) {

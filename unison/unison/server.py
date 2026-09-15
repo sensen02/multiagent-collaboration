@@ -439,7 +439,7 @@ class App:
             t=r.task(data['task_id']); r.cancel_task(t['id']); return {'cancelled':t['id']}
         if method=='POST' and path=='/api/cancel':
             run=r.run(data['run_id']); r.cancel_task(run['root_task']); run['status']='cancelled'; s.put('run',run); return run
-        if method=='POST' and path=='/api/archive': return r.workspace.archive(r.run(data['run_id']))
+        if method=='POST' and path=='/api/archive': return r.archive_run(data['run_id'])
         if method=='POST' and path=='/api/restore': return r.workspace.restore_archive(data['archive_path'],data.get('task_id'),data.get('version','after'))
         if method=='POST' and path=='/api/compact':
             t=r.task(data['task_id']); t['compact_requested']=True; s.put('task',t)
@@ -514,8 +514,10 @@ class Handler(BaseHTTPRequestHandler):
             data=json.loads(self.rfile.read(int(self.headers.get('Content-Length',0))))
             # 可用性验证要逐模型发起真实请求，给更长的等待窗口。
             tail=urlparse(self.path).path
-            # 可用性验证与技能调用都要等真实外部工作，给足够长的窗口。
-            timeout=300 if tail.endswith('/verify') else (MAX_WAIT+60 if tail=='/api/skills/call' else 60)
+            # 可用性验证、技能调用与归档都要等真实外部工作，给足够长的窗口。
+            # 归档尤其不能按 60 秒掐断：它要先对账、打包整份运行记录，再释放工作区副本，
+            # 中途超时会让用户以为"归档失败"，而服务端其实还在写。
+            timeout=300 if tail.endswith(('/verify','/archive')) else (MAX_WAIT+60 if tail=='/api/skills/call' else 60)
             self.send_json(self.server.app.call('POST',urlparse(self.path).path,data,timeout=timeout))
         except Exception as e: self.send_error_json(e)
 

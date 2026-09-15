@@ -199,6 +199,8 @@ class WorkspaceScan(MaintenanceJob):
         changed=0
         for task in sorted(tasks,key=lambda x:-x['created']):
             run=runtime.run(task['run_id'])
+            # 归档即结案：工作区副本已释放、记录已冻结，不再对它做文件对账。
+            if run.get('archived'): continue
             observable=runtime.current(task) or (run.get('root_task')==task['id'] and run['status'] in {'active','completed','paused'})
             if not observable or task['workspace'] in seen or task['id'] in runtime.processes: continue
             seen.add(task['workspace'])

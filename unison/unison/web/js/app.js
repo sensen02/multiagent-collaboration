@@ -4,7 +4,7 @@
  */
 
 import { createClient, openStream, ApiError } from './api.js';
-import { esc, attr, toast } from './ui.js';
+import { esc, attr, bytes, toast } from './ui.js';
 import * as views from './views.js';
 
 const api = createClient();
@@ -36,6 +36,7 @@ const view = {
   compose: { runId: null, text: '' },
   drawer: null, // { kind: 'task' | 'blob' | 'skill', ... }
   lastArchive: null,
+  archivedOpen: false,   // “已归档会话”默认折叠
   refreshError: '',
 };
 
@@ -179,19 +180,38 @@ function jumpToWaitingQuestion() {
   toast('有 Agent 在等你回答：已跳到它的对话，整个运行已暂停', 'warn', 8000);
 }
 
-function visibleRuns() {  const query = view.search.trim().toLowerCase();
+function matchesSearch(run, query) {
+  if (!query) return true;
+  return `${run.goal} ${run.model_id} ${run.id}`.toLowerCase().includes(query);
+}
+
+// 活动列表不含已归档会话：归档即结案，它挪到下面那个默认折叠的分区里。
+// 状态筛选只作用于活动列表（归档会话已经不参与"进行中/需处理"的语义），搜索对两边都生效。
+function visibleRuns() {
+  const query = view.search.trim().toLowerCase();
   const filter = views.FILTERS.find((item) => item.id === view.filter) || views.FILTERS[0];
   return state.runs
+    .filter((run) => !run.archived)
     .filter((run) => (filter.id === 'all' ? true : filter.match.includes(run.status)))
-    .filter((run) => (query ? `${run.goal} ${run.model_id} ${run.id}`.toLowerCase().includes(query) : true))
+    .filter((run) => matchesSearch(run, query))
     .sort((a, b) => b.created - a.created);
+}
+
+// 已归档会话：记录一条都不少，默认按归档时间倒序。
+function archivedRuns() {
+  const query = view.search.trim().toLowerCase();
+  return state.runs
+    .filter((run) => run.archived)
+    .filter((run) => matchesSearch(run, query))
+    .sort((a, b) => (b.archived || 0) - (a.archived || 0));
 }
 
 /* ------------------------------------------------------------------ 渲染 */
 
 function renderChrome() {
   const run = currentRun();
-  $('#run-list').innerHTML = views.renderRunList(visibleRuns(), { selected: view.runId, questions: state.questions });
+  $('#run-list').innerHTML = views.renderRunList(visibleRuns(), { selected: view.runId, questions: state.questions })
+    + views.renderArchivedList(archivedRuns(), { selected: view.runId, questions: state.questions, open: view.archivedOpen });
   $('#run-filters').innerHTML = views.renderFilters(state.runs, view.filter);
   $('#sidebar-foot').innerHTML = views.renderSidebarFoot(state);
   $('#breadcrumb').innerHTML = views.renderBreadcrumb(run);
@@ -549,14 +569,37 @@ const actions = {
     toast(run.status === 'paused' ? '已继续运行' : '已暂停派发新任务', 'success');
   }),
 
-  'archive': (el) => withBusy(el, async () => {
+  'toggle-archived': () => {
+    view.archivedOpen = !view.archivedOpen;
+    renderChrome();
+  },
+
+  'archive': (el) => {
     const run = currentRun();
     if (!run) return;
-    const result = await api.post('archive', { run_id: run.id });
-    view.lastArchive = result.path;
-    await renderMain();
-    toast('已归档事件、文件版本与报告', 'success');
-  }),
+    // 归档是结案，不是"再存一份"：它会停掉这个运行的一切并释放子任务工作区副本，
+    // 所以先把后果说清楚再动手。
+    const ok = confirm(
+      '归档会把这个运行结案：\n'
+      + '· 停止它的全部 AI 与它们派生的进程\n'
+      + '· 释放子任务工作区副本（磁盘回收）\n'
+      + '· 事件、报告与文件修改记录保留，仍可查看与追溯\n'
+      + '· 归档后不能再继续这个运行\n\n'
+      + '确定归档？',
+    );
+    if (!ok) return;
+    withBusy(el, async () => {
+      const result = await api.post('archive', { run_id: run.id }, { timeoutMs: 900000 });
+      view.lastArchive = result.archive_path;
+      invalidate();
+      await refresh();
+      const parts = [];
+      if (result.released?.length) parts.push(`释放 ${bytes(result.freed_bytes)} / ${result.released.length} 个工作区副本`);
+      if (result.stopped?.length) parts.push(`停止 ${result.stopped.length} 个任务`);
+      parts.push(`保留 ${result.files_kept} 条文件修改记录`);
+      toast(`已归档并结案：${parts.join('，')}`, 'success', 8000);
+    });
+  },
 
   'restore': (el) => withBusy(el, async () => {
     const result = await api.post('restore', { archive_path: el.dataset.path });
