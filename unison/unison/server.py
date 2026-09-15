@@ -11,7 +11,7 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs
-from .runtime import Runtime, TERMINAL
+from .runtime import Runtime, TERMINAL, HISTORY_EVENT_TYPES
 from .store import dumps, uid, now
 from .models import HEALTH_OK_TTL, HEALTH_TRANSIENT_LIMIT
 from .skills import SkillError, render_content
@@ -148,7 +148,14 @@ class App:
     async def dispatch(self,method,path,data,q):
         r=self.runtime; s=r.store
         if method=='GET' and path=='/api/state':
-            tasks=[{k:v for k,v in t.items() if k not in {'history','base_manifest','manifest'}} for t in s.all('task')]
+            # 快照只给控制台要看的东西。剔掉的全是**文件对账的内部台账**：
+            # file_stats（逐文件 mtime/size/hash，451 KB）、manifest / base_manifest /
+            # last_integrated_manifest（约 580 KB）、modes / base_modes（约 200 KB）、
+            # integrated_targets（81 KB）。它们占响应的 80%，而界面一个字段都不读
+            # （明细走 /api/files 与 /api/task），每 800ms 的刷新没必要搬这一兆。
+            bookkeeping={'history','base_manifest','manifest','file_stats','modes','base_modes',
+                         'integrated_targets','last_integrated_manifest','baseline_id','file_stats_at'}
+            tasks=[{k:v for k,v in t.items() if k not in bookkeeping} for t in s.all('task')]
             configs=s.all('app_config')
             playground=self.default_workspace()
             return {'runs':s.all('run'),'tasks':tasks,'models':r.models.list(),'questions':s.all('question'),
@@ -191,7 +198,9 @@ class App:
             return events
         if method=='GET' and path=='/api/replay':
             run_id=q['run_id'][0]; until=int(q['until'][0])
-            events=[e for e in s.events(run_id,limit=1000000) if e['seq']<=until]
+            # 回放只用 seq/task_id/type 重建任务与状态，不读负载：把 151 MB 的负载解析一遍
+            # 要 1.5 秒，而这三列在 SQL 里就能直接取出来。
+            events=s.event_index(run_id,until)
             tasks={}
             changes={'TaskSubmitted':'queued','TaskClaimed':'running','TaskQueued':'queued','WaitRegistered':'waiting','QuestionRaised':'waiting','TaskWoken':'queued','TaskCompleted':'completed','TaskFailed':'failed','TaskCancelled':'cancelled','TaskSuperseded':'superseded'}
             for event in events:
@@ -207,7 +216,7 @@ class App:
                     'history':r.task_history(t),
                     'messages':[m for m in s.all('message') if m['task_id']==t['id']],
                     'reports':[x for x in s.all('report') if x['task_id']==t['id']],
-                    'changes':r.workspace.changes(t),'events':[e for e in s.events(t['run_id'],limit=100000) if e['task_id']==t['id']][-200:]}
+                    'changes':r.workspace.changes(t),'events':s.task_events(t['id'],200)}
         if method=='GET' and path=='/api/transcript':
             # 对话视图的数据源：一次拿到这个运行里**每个 Agent 的可见历史**。
             # 为什么不复用 /api/task：控制台每次刷新都要看全部 Agent，逐个任务请求就是
@@ -218,10 +227,16 @@ class App:
             limit=min(500,max(1,int(q.get('limit',[150])[0])))
             chars=min(60000,max(200,int(q.get('message_chars',[8000])[0])))
             questions=[x for x in s.all('question') if x['run_id']==run_id]
+            # 这个运行的事件**取一次**，交给每个任务的历史派生共用：历史是同一份日志的
+            # 纯函数，逐任务各取一遍纯粹是白解析（某真实运行 5 个任务 → 756 MB → 5.6 秒）。
+            # 报告与消息同样提到循环外，避免每个任务都把全表重解析一遍。
+            events=s.events(run_id,limit=1000000,types=HISTORY_EVENT_TYPES)
+            all_reports=s.all('report')
+            all_messages=s.all('message')
             agents=[]
             for t in s.all('task'):
                 if t['run_id']!=run_id: continue
-                history=r.task_history(t)
+                history=r.task_history(t,events)
                 messages=[]
                 for m in history[-limit:]:
                     content=m.get('content')
@@ -235,7 +250,7 @@ class App:
                     if m.get('tool_call_id'): item['tool_call_id']=m['tool_call_id']
                     if m.get('reasoning_content'): item['reasoning']=str(m['reasoning_content'])[:2000]
                     messages.append(item)
-                reports=[x for x in s.all('report') if x['task_id']==t['id']]
+                reports=[x for x in all_reports if x['task_id']==t['id']]
                 agents.append({
                     'id':t['id'],'goal':t.get('goal'),'parent_id':t.get('parent_id'),'model_id':t.get('model_id'),
                     'status':t.get('status'),'revision':t.get('revision'),'created':t.get('created'),
@@ -250,7 +265,7 @@ class App:
                     'questions':[x for x in questions if x['task_id']==t['id']],
                     'unread':[{'id':m['id'],'summary':m.get('summary'),'topic':m.get('topic'),'kind':m.get('kind'),
                                'delivery':m.get('delivery'),'from_task':m.get('from_task'),'created':m.get('created')}
-                              for m in s.all('message') if m['task_id']==t['id'] and not m.get('consumed')],
+                              for m in all_messages if m['task_id']==t['id'] and not m.get('consumed')],
                     'report':({'id':reports[-1]['id'],'summary':reports[-1].get('summary'),
                                'verification_status':reports[-1].get('verification_status'),
                                'files':reports[-1].get('files'),'unknowns':reports[-1].get('unknowns')}

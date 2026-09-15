@@ -20,6 +20,11 @@ from . import providers
 TERMINAL = {'completed','failed','cancelled','superseded'}
 MAX_COMPACT_PER_STEP = 3
 
+# 历史派生（derive_history）真正读的事件类型，就这四种。
+# 用它过滤是必要的：`ModelReturned` 单条可达 176 KB（上游逐条消息的 usage 归属），
+# 在真实运行里占了事件总量的 99%，而派生一行都不看它。
+HISTORY_EVENT_TYPES = ('MessageAppended','ToolResultRecorded','ToolRepairRecorded','ContextCompacted')
+
 
 def describe_error(error):
     """Keep the provider-neutral failure code visible in task errors and the console."""
@@ -197,14 +202,20 @@ class Runtime:
         events=self.store.events(task['run_id'],limit=1000000) if events is None else events
         return any(e['task_id']==task['id'] and e['type']=='MessageAppended' for e in events)
 
-    def task_history(self,task):
+    def task_history(self,task,events=None):
         """这次模型调用要读的历史。
 
         - 有消息日志的任务：**完全由日志派生**（任务记录里没有副本可读）。
         - 旧任务（升级前创建，没有消息日志）：回退到记录里的 `history` 字段。
+
+        `events` 可由调用方传入：一个运行里每个任务的历史都从**同一份事件日志**派生，
+        循环调用时只该取一次。取一次就是几百 MB 的差别——某真实运行 5 个任务、151 MB
+        事件，逐任务各取一遍要解析 756 MB（5.6 秒），而派生真正需要的只有 0.35 MB。
         """
-        if not self.has_message_log(task): return task.get('history') or []
-        messages,_=self.derive_history(task,self.store.events(task['run_id'],limit=1000000))
+        if events is None:
+            events=self.store.events(task['run_id'],limit=1000000,types=HISTORY_EVENT_TYPES)
+        if not self.has_message_log(task,events): return task.get('history') or []
+        messages,_=self.derive_history(task,events)
         # 轻量一致性校验：消息数应当与日志记下的条数一致，不一致说明派生缺了东西。
         expected=task.get('history_messages')
         if isinstance(expected,int) and expected!=len(messages):

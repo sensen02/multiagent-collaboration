@@ -56,6 +56,12 @@ class Store:
                   workspace TEXT PRIMARY KEY, generation INTEGER NOT NULL DEFAULT 0,
                   manifest_id TEXT NOT NULL, updated REAL NOT NULL);
             ''',
+            # 按任务取事件（任务详情抽屉要"这个任务发生了什么"）。没有这个索引，
+            # `WHERE task_id=?` 就是一次全表扫描——事件表 196 MB、单条负载可达 176 KB，
+            # 一次要 1.2 秒；有索引之后是按 (task_id, seq) 的定位读取。
+            3: '''
+                CREATE INDEX IF NOT EXISTS events_task ON events(task_id, seq);
+            ''',
         }
         latest = max(migrations)
         if version > latest:
@@ -107,10 +113,43 @@ class Store:
                         (id,run_id,task['id'] if task else None,revision,type,now(),dumps(payload or {})))
         return self.db.execute('SELECT last_insert_rowid()').fetchone()[0]
 
-    def events(self, run_id=None, after=0, limit=500):
-        rows = self.db.execute('SELECT * FROM events WHERE seq>? AND (? IS NULL OR run_id=?) ORDER BY seq LIMIT ?',
-                               (after,run_id,run_id,limit))
+    def events(self, run_id=None, after=0, limit=500, types=None):
+        """按序取事件。`types` 只取这几类——**这不是优化选项，是必要的过滤**。
+
+        `ModelReturned` 带上游逐条消息的 usage 归属：一次调用 1600+ 条 item、单条事件
+        176 KB，实测占某个运行 151 MB 里的 99%。而历史派生一行都不用它——
+        不过滤就等于为 0.35 MB 的正文解析 151 MB 的 JSON（430 倍）。
+        """
+        sql = 'SELECT * FROM events WHERE seq>? AND (? IS NULL OR run_id=?)'
+        params = [after, run_id, run_id]
+        if types:
+            sql += " AND type IN (%s)" % ','.join('?' * len(types))
+            params.extend(types)
+        sql += ' ORDER BY seq LIMIT ?'
+        params.append(limit)
+        rows = self.db.execute(sql, params)
         return [dict(r) | {'payload': json.loads(r['payload'])} for r in rows]
+
+    def event_index(self, run_id, until=None):
+        """只取 (seq, task_id, type)：回放与协作图不读负载。
+
+        用 `events()` 取同样这些行会把整个运行的负载全部解析一遍（大运行约 1.5 秒），
+        而回放根本不需要负载。
+        """
+        rows = self.db.execute(
+            'SELECT seq, task_id, type FROM events WHERE run_id=? AND (? IS NULL OR seq<=?) ORDER BY seq',
+            (run_id, until, until))
+        return [dict(r) for r in rows]
+
+    def task_events(self, task_id, limit=200):
+        """某个任务的**最近**若干条事件（含负载，抽屉里要看原文）。
+
+        `events()` 是"某运行里 seq>游标的前 N 条"，语义不同；这里要的是"这个任务发生过
+        什么"，并且只留尾部。走 events_task 索引，避免为 200 条记录把整个运行解析一遍。
+        """
+        rows = self.db.execute('SELECT * FROM events WHERE task_id=? ORDER BY seq DESC LIMIT ?',
+                               (task_id, limit)).fetchall()
+        return [dict(r) | {'payload': json.loads(r['payload'])} for r in reversed(rows)]
 
     def cursor(self):
         return self.db.execute('SELECT COALESCE(MAX(seq),0) FROM events').fetchone()[0]
