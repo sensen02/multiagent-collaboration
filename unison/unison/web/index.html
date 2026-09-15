@@ -99,6 +99,20 @@
   </form>
 </dialog>
 
+<dialog id="dlg-confirm" class="dialog">
+  <div class="form">
+    <header class="dialog-head">
+      <h2 id="confirm-title">确认</h2>
+      <button type="button" class="icon-btn" data-close aria-label="关闭">✕</button>
+    </header>
+    <div id="confirm-body"></div>
+    <footer class="dialog-foot">
+      <button type="button" class="btn" id="confirm-no" data-action="confirm-no">取消</button>
+      <button type="button" class="btn danger" id="confirm-yes" data-action="confirm-yes">确定</button>
+    </footer>
+  </div>
+</dialog>
+
 <dialog id="dlg-models" class="dialog wide">
   <div class="form">
     <header class="dialog-head">

@@ -545,6 +545,12 @@ details.raw > summary:hover { color: var(--c-text-2); }
 .dialog-title-block p { margin-top: 3px; color: var(--c-text-3); font-size: var(--fs-12); line-height: var(--lh-12); }
 .dialog-foot { display: flex; justify-content: flex-end; gap: var(--sp-2); margin-top: var(--sp-1); }
 .dialog-foot .spacer { flex: 1; }
+
+/* 确认弹窗的后果清单：逐条列出"点了会发生什么"，而不是一句笼统的"确定吗？" */
+.confirm-list { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; font-size: var(--fs-13); line-height: var(--lh-13); color: var(--c-text-2); }
+.confirm-list li::marker { color: var(--c-text-4); }
+#dlg-confirm .note.warn { margin-top: var(--sp-2); }
+#dlg-confirm { width: min(460px, calc(100vw - 32px)); }
 .optional { color: var(--c-text-4); font-weight: 400; }
 .config-format-tabs { display: grid; grid-template-columns: 1fr 1fr; gap: var(--sp-2); padding: 3px; border: 1px solid var(--c-line-2); border-radius: var(--r-md); background: var(--c-bg-sub); }
 .config-format-tab { min-height: 36px; padding: 0 var(--sp-3); border: 0; border-radius: var(--r-sm); background: transparent; color: var(--c-text-3); font-size: var(--fs-13); cursor: pointer; }

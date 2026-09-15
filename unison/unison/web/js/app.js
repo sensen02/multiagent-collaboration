@@ -50,6 +50,38 @@ let stream = null;
 
 const $ = (selector) => document.querySelector(selector);
 
+/* ------------------------------------------------------------ 确认弹窗 */
+
+/**
+ * 破坏性操作的确认，用与应用内其它对话框同款的一个弹窗。
+ *
+ * 为什么不用原生 `confirm()`：它的标题栏显示的是页面地址，正文只能是一行纯文本，
+ * 后果说不清楚；而且点"取消"没有任何反馈——用户不知道是没点上、还是被忽略了。
+ * 这里把后果逐条列出来，确定与取消走同一条结算路径，不会留下悬挂的 await。
+ */
+let confirmResolve = null;
+
+function settleConfirm(value) {
+  const resolve = confirmResolve;
+  confirmResolve = null;
+  const dialog = $('#dlg-confirm');
+  if (dialog.open) dialog.close();   // close 事件回来时 confirmResolve 已空，是安全的 no-op
+  if (resolve) resolve(value);
+}
+
+function confirmAction({ title, lines = [], note = '', confirmLabel = '确定', cancelLabel = '取消' }) {
+  const dialog = $('#dlg-confirm');
+  if (confirmResolve) settleConfirm(false);   // 上一次没结算：先收掉，绝不叠弹窗
+  $('#confirm-title').textContent = title;
+  $('#confirm-body').innerHTML = (lines.length
+    ? `<ul class="confirm-list">${lines.map((line) => `<li>${esc(line)}</li>`).join('')}</ul>`
+    : '') + (note ? `<p class="note warn">${esc(note)}</p>` : '');
+  $('#confirm-yes').textContent = confirmLabel;
+  $('#confirm-no').textContent = cancelLabel;
+  dialog.showModal();
+  return new Promise((resolve) => { confirmResolve = resolve; });
+}
+
 /* --------------------------------------------------------------- 缓存读取 */
 
 function cached(key, loader) {
@@ -471,6 +503,9 @@ async function withBusy(button, action) {
 }
 
 const actions = {
+  'confirm-yes': () => settleConfirm(true),
+  'confirm-no': () => settleConfirm(false),
+
   'select-run': (el) => {
     view.runId = el.dataset.run;
     view.replayCursor = null;
@@ -542,8 +577,18 @@ const actions = {
 
   'cancel-task': (el) => {
     const taskId = view.drawer?.taskId;
-    if (!taskId || !confirm('取消该任务及其子树？已产生的文件与记录会保留。')) return;
+    if (!taskId) return;
     withBusy(el, async () => {
+      const ok = await confirmAction({
+        title: '取消该任务及其子树',
+        lines: [
+          '取消这个任务，以及它派生的全部子任务',
+          '已经产生的文件、事件与报告都保留',
+          '正在执行的命令会被终止',
+        ],
+        confirmLabel: '取消任务',
+      });
+      if (!ok) { toast('已取消操作，任务照常运行', 'info'); return; }
       await api.post('task/cancel', { task_id: taskId });
       invalidate();
       await refresh();
@@ -577,18 +622,20 @@ const actions = {
   'archive': (el) => {
     const run = currentRun();
     if (!run) return;
-    // 归档是结案，不是"再存一份"：它会停掉这个运行的一切并释放子任务工作区副本，
-    // 所以先把后果说清楚再动手。
-    const ok = confirm(
-      '归档会把这个运行结案：\n'
-      + '· 停止它的全部 AI 与它们派生的进程\n'
-      + '· 释放子任务工作区副本（磁盘回收）\n'
-      + '· 事件、报告与文件修改记录保留，仍可查看与追溯\n'
-      + '· 归档后不能再继续这个运行\n\n'
-      + '确定归档？',
-    );
-    if (!ok) return;
     withBusy(el, async () => {
+      // 归档是结案，不是"再存一份"：先把后果逐条说清楚，再动手。
+      const ok = await confirmAction({
+        title: '归档并结案',
+        lines: [
+          '停止这个运行的全部 AI，以及它们派生的进程',
+          '释放子任务工作区副本，磁盘回收',
+          '事件、报告与文件修改记录保留，仍可查看与追溯',
+          '归档后不能再继续这个运行',
+        ],
+        note: '归档不可撤销：副本删除后只能从归档恢复到新目录。',
+        confirmLabel: '归档并结案',
+      });
+      if (!ok) { toast('已取消归档，什么都没变', 'info'); return; }
       const result = await api.post('archive', { run_id: run.id }, { timeoutMs: 900000 });
       view.lastArchive = result.archive_path;
       invalidate();
@@ -613,8 +660,19 @@ const actions = {
 
   'cancel': (el) => {
     const run = currentRun();
-    if (!run || !confirm('停止后该运行不能再继续，确定停止？')) return;
+    if (!run) return;
     withBusy(el, async () => {
+      const ok = await confirmAction({
+        title: '停止这个运行',
+        lines: [
+          '停止主调度与全部子任务，沿所有权树一起取消',
+          '它们正在执行的命令会被终止',
+          '已经写入项目的文件、事件与报告都保留',
+          '停止后这个运行不能再继续；要接着做请新建任务',
+        ],
+        confirmLabel: '停止运行',
+      });
+      if (!ok) { toast('已取消停止，运行照常', 'info'); return; }
       await api.post('cancel', { run_id: run.id });
       invalidate();
       await refresh();
@@ -895,6 +953,9 @@ $('#dlg-new').addEventListener('close', () => hideError('#new-error'));
 $('#new-model').addEventListener('change', () => showModelWarning());
 $('#dlg-revise').addEventListener('close', () => hideError('#revise-error'));
 $('#dlg-models').addEventListener('close', () => hideError('#import-error'));
+// ✕、Esc、点遮罩都会走到这里：确认弹窗必须以"取消"收场，不能把 await 挂在那里。
+$('#dlg-confirm').addEventListener('close', () => settleConfirm(false));
+$('#dlg-confirm').addEventListener('cancel', (event) => { event.preventDefault(); settleConfirm(false); });
 
 $('#form-new').addEventListener('submit', (event) => {
   event.preventDefault();
