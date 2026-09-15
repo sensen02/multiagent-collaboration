@@ -2,6 +2,7 @@
 import json
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -189,6 +190,43 @@ class HttpServiceTests(unittest.TestCase):
         # 任务记录里不再保存历史副本，只有消息数。
         self.assertNotIn('history', payload['task'])
         self.assertEqual(payload['task']['history_messages'], len(payload['history']))
+
+    def test_transcript_groups_history_by_agent_and_reports_the_hold(self):
+        """对话视图的数据契约：按 Agent 分组的历史 + "整个运行正停着等人"这一条事实。"""
+        run = self.demo_run('演示问答：对话视图')
+        deadline = time.time() + 60
+        questions = []
+        while time.time() < deadline:
+            state = self.request('/state', token='test-token')
+            questions = [q for q in state['questions'] if q['run_id'] == run['id'] and q['status'] == 'open']
+            if questions:
+                break
+            time.sleep(.3)
+        else:
+            self.fail('等不到人工提问')
+
+        payload = self.request(f"/transcript?run_id={run['id']}&limit=50", token='test-token')
+        self.assertTrue(payload['hold']['paused'])
+        self.assertEqual(payload['hold']['reason'], 'human_question')
+        self.assertIn(questions[0]['task_id'], payload['hold']['waiting_on'])
+        agents = payload['agents']
+        # 主调度在最前（父为空），子任务排在后面。
+        self.assertIsNone(agents[0]['parent_id'])
+        self.assertTrue(all(a['parent_id'] for a in agents[1:]))
+        asker = [a for a in agents if a['id'] == questions[0]['task_id']][0]
+        self.assertEqual(asker['questions'][0]['status'], 'open')
+        self.assertEqual([m['role'] for m in agents[0]['messages']][:2], ['system', 'system'])
+        self.assertTrue(any(m.get('tool_calls') for a in agents for m in a['messages']))
+
+        # 暂停是运行时的事实，不只是界面上的说法。
+        paused = [r for r in self.request('/state', token='test-token')['runs'] if r['id'] == run['id']][0]
+        self.assertEqual(paused['status'], 'paused')
+        self.assertEqual(paused['pause_reason'], 'human_question')
+
+        self.request('/answer', {'id': questions[0]['id'], 'answer': '对话视图'}, token='test-token')
+        resumed = [r for r in self.request('/state', token='test-token')['runs'] if r['id'] == run['id']][0]
+        self.assertEqual(resumed['status'], 'active')
+        self.assertEqual(resumed['pause_reason'], '')
 
     def test_verify_endpoint_rejects_unknown_provider_and_skips_fresh_models(self):
         """复验端点的省 token 契约。

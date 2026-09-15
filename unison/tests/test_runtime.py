@@ -249,6 +249,77 @@ class RuntimeTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):await self.r.compact(t,1)
         self.assertEqual(self.r.task_history(self.r.task(t['id'])),self.r.task_history(t))
 
+    async def test_human_question_pauses_every_agent_until_answered(self):
+        """一个 Agent 向人类提问 = **整个运行**停下，直到这句话被回答。
+
+        为什么不是只停提问的那一个：人还没回答时别的 Agent 继续跑，就是基于"还没定的事"
+        往下做，回答一到它们手里的判断全作废——既烧钱又制造返工。
+        所以这里断言的是"全体停"，而不是"提问者停"。
+        """
+        run,t=self.create('离线演示：整体暂停')
+        await self.r.start()
+        await self.wait_until(lambda:bool(self.r.store.all('question')))
+        q=self.r.store.all('question')[0]
+        fresh=self.r.run(run['id'])
+        self.assertEqual(fresh['status'],'paused')
+        self.assertEqual(fresh['pause_reason'],'human_question')
+        # 在飞的那一轮必须交回队列，不能卡在 running：卡住的任务恢复后不会被领取。
+        await self.wait_until(lambda:not [x for x in self.r.store.all('task') if x['status']=='running'])
+        await asyncio.sleep(.3)
+        self.assertFalse([x for x in self.r.store.all('task') if x['status']=='running'],
+                         '暂停期间不应有任何任务处于 running')
+        self.r.answer(q['id'],'整体暂停测试')
+        self.assertEqual(self.r.run(run['id'])['status'],'active')
+        await self.wait_until(lambda:self.r.run(run['id'])['status']=='completed',15)
+
+    async def test_human_pause_lifts_only_after_the_last_open_question(self):
+        """并发提问时，答完一个不算完——还剩 open 就继续停着。"""
+        run,t=self.create()
+        first=self.r.create_task(run,'第一个提问题的','test',t)
+        second=self.r.create_task(run,'第二个提问题的','test',t)
+        await self.r.tool_human_ask(first,{'question':'first?'})
+        await self.r.tool_human_ask(second,{'question':'second?'})
+        questions={q['question']:q for q in self.r.store.all('question')}
+        self.r.answer(questions['first?']['id'],'a')
+        self.assertEqual(self.r.run(run['id'])['status'],'paused','还有问题没答，不该放行')
+        self.r.answer(questions['second?']['id'],'b')
+        self.assertEqual(self.r.run(run['id'])['status'],'active')
+        self.assertEqual(self.r.run(run['id'])['pause_reason'],'')
+        # 两个提问者都要回到队列（唤醒是循环里的事，这里显式跑一次）。
+        self.r.wake_waiters()
+        self.assertEqual(self.r.task(first['id'])['status'],'queued')
+        self.assertEqual(self.r.task(second['id'])['status'],'queued')
+
+    async def test_paused_run_parks_inflight_task_instead_of_killing_it(self):
+        """暂停时在飞的任务交回队列：既不判负，也不留在 running。"""
+        run,t=self.create()
+        self.r.pause_run(run['id'])
+        running=self.r.task(t['id']); running['status']='running'; self.r.store.put('task',running)
+        await self.r.step(running['id'],running['epoch'])
+        parked=self.r.task(t['id'])
+        self.assertEqual(parked['status'],'queued')
+        self.assertIsNone(parked.get('error'))
+        self.assertIn('TaskParked',[e['type'] for e in self.r.store.events(run['id'],limit=1000)])
+
+    async def test_manual_resume_overrides_a_human_pause(self):
+        """人工点"继续运行"是显式覆盖：即使问题还没答，也按人的意思跑。"""
+        run,t=self.create()
+        await self.r.tool_human_ask(t,{'question':'还等吗？'})
+        self.assertEqual(self.r.run(run['id'])['status'],'paused')
+        self.r.resume_run(run['id'])
+        fresh=self.r.run(run['id'])
+        self.assertEqual(fresh['status'],'active')
+        self.assertEqual(fresh['pause_reason'],'')
+
+    async def test_cancelling_the_asker_releases_the_pause(self):
+        """提问题的人被取消后，那个问题永远不会有人回答：别让整个运行陪着停。"""
+        run,t=self.create()
+        asker=self.r.create_task(run,'提问者','test',t)
+        await self.r.tool_human_ask(asker,{'question':'还要吗？'})
+        self.assertEqual(self.r.run(run['id'])['status'],'paused')
+        self.r.cancel_task(asker['id'])
+        self.assertEqual(self.r.run(run['id'])['status'],'active')
+
     async def test_restart_preserves_wait_and_question(self):
         run,t=self.create();await self.r.tool_human_ask(t,{'question':'persist?'})
         self.r.store.close()

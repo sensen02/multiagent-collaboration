@@ -208,6 +208,59 @@ class App:
                     'messages':[m for m in s.all('message') if m['task_id']==t['id']],
                     'reports':[x for x in s.all('report') if x['task_id']==t['id']],
                     'changes':r.workspace.changes(t),'events':[e for e in s.events(t['run_id'],limit=100000) if e['task_id']==t['id']][-200:]}
+        if method=='GET' and path=='/api/transcript':
+            # 对话视图的数据源：一次拿到这个运行里**每个 Agent 的可见历史**。
+            # 为什么不复用 /api/task：控制台每次刷新都要看全部 Agent，逐个任务请求就是
+            # N 次往返，而 SSE 每 800ms 触发一次刷新；而且历史来自日志派生（唯一事实源），
+            # 这里给出的正是模型当时真正看到的那些消息。
+            run_id=q['run_id'][0]
+            run=r.run(run_id)
+            limit=min(500,max(1,int(q.get('limit',[150])[0])))
+            chars=min(60000,max(200,int(q.get('message_chars',[8000])[0])))
+            questions=[x for x in s.all('question') if x['run_id']==run_id]
+            agents=[]
+            for t in s.all('task'):
+                if t['run_id']!=run_id: continue
+                history=r.task_history(t)
+                messages=[]
+                for m in history[-limit:]:
+                    content=m.get('content')
+                    if isinstance(content,str) and len(content)>chars:
+                        content=content[:chars]+f'\n…（此处截断，原文 {len(m["content"])} 字符）'
+                    item={'role':m.get('role'),'content':content}
+                    if m.get('tool_calls'):
+                        item['tool_calls']=[{'id':c.get('id'),'name':(c.get('function') or {}).get('name'),
+                                             'arguments':(c.get('function') or {}).get('arguments')}
+                                            for c in m['tool_calls']]
+                    if m.get('tool_call_id'): item['tool_call_id']=m['tool_call_id']
+                    if m.get('reasoning_content'): item['reasoning']=str(m['reasoning_content'])[:2000]
+                    messages.append(item)
+                reports=[x for x in s.all('report') if x['task_id']==t['id']]
+                agents.append({
+                    'id':t['id'],'goal':t.get('goal'),'parent_id':t.get('parent_id'),'model_id':t.get('model_id'),
+                    'status':t.get('status'),'revision':t.get('revision'),'created':t.get('created'),
+                    'priority':t.get('priority'),'workspace':t.get('workspace'),'project_root':t.get('project_root'),
+                    'wait':t.get('wait'),'error':t.get('error'),'result':t.get('result'),
+                    'last_model_at':t.get('last_model_at'),'terminal_seq':t.get('terminal_seq'),
+                    'history_messages':int(t.get('history_messages',0)),'history_total':len(history),
+                    'history_truncated':max(0,len(history)-len(messages)),
+                    'messages':messages,
+                    'questions':[x for x in questions if x['task_id']==t['id']],
+                    'unread':[{'id':m['id'],'summary':m.get('summary'),'topic':m.get('topic'),'kind':m.get('kind'),
+                               'delivery':m.get('delivery'),'from_task':m.get('from_task'),'created':m.get('created')}
+                              for m in s.all('message') if m['task_id']==t['id'] and not m.get('consumed')],
+                    'report':({'id':reports[-1]['id'],'summary':reports[-1].get('summary'),
+                               'verification_status':reports[-1].get('verification_status'),
+                               'files':reports[-1].get('files'),'unknowns':reports[-1].get('unknowns')}
+                              if reports else None),
+                })
+            agents.sort(key=lambda a:(a['parent_id'] is not None,a.get('created') or 0))
+            open_questions=[{'id':x['id'],'task_id':x['task_id'],'question':x['question'],'options':x.get('options',[]),
+                             'created':x.get('created')} for x in questions if x['status']=='open']
+            return {'run':run,'agents':agents,'questions':questions,'open_questions':open_questions,
+                    'hold':{'paused':run['status']=='paused','reason':run.get('pause_reason') or '',
+                            'waiting_on':[x['task_id'] for x in open_questions]},
+                    'note':'历史来自事件日志派生；对话按 Agent（任务）分组，主调度在前。'}
         if method=='GET' and path=='/api/files':
             run_id=q['run_id'][0]
             changes=[]; omitted=[]

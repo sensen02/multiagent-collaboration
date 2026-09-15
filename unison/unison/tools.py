@@ -38,7 +38,7 @@ TOOLS = [
  tool('tasks_close','收束某任务前先排空它在途请求：mode=drain 等它答完（或到时限），mode=forfeit 显式作废并通知对方不必再答。不要在对方还有未答问题时强行让它汇报，那样会留下无人认领的答复。',
       {'source_task':S,'mode':{'type':'string','enum':['drain','forfeit']},'request_ids':A,'timeout_seconds':{'type':'number'},'reason':S},['source_task']),
  tool('tasks_cancel','取消任务及子树；历史产物保留。',{'task_id':S},['task_id']),
- tool('human_ask','向人类提出问题并挂起当前任务，释放执行槽。必须为本轮最后一个工具。',{'question':S,'options':A},['question']),
+ tool('human_ask','向人类提出问题。**整个运行会因此暂停**：所有 Agent 做完当前这一轮就停手，人类回答后自动继续，回答作为消息回到你手里。所以提问前先想清楚——这一问会让全队一起等；答案不依赖人类的问题（读文件、跑测试、问同伴）不要用它。必须为本轮最后一个工具。',{'question':S,'options':A},['question']),
  tool('workspace_list','列出文件或目录。所有模型均可直接操作代码。',{'path':S}),
  tool('workspace_read','按行读取文件，默认最多 200 行，长文件按需读取。',{'path':S,'start':I,'limit':I},['path']),
  tool('workspace_image_info','读取 PNG/JPEG/WebP/GIF 文件头，返回格式、存储尺寸（不应用 EXIF 旋转）、字节数与 SHA-256；不解码像素，不判断图片内容或完整可解码性。',{'path':S},['path']),
@@ -98,4 +98,5 @@ SYSTEM = '''你是 Unison 本地协作系统中的一个智能体。主与子使
 并发时消息可能在你推理期间到达（收件箱在步骤开始时清空）：这一轮看不到它很正常，下一轮会被退回给你处理，不要以为会丢。
 只有真实验证支持时 verified 才能为 true。你给出的证据会与真实执行记录绑定；运行时只记录事实（命令原文、退出码、是否超时），**不替你判断证据够不够**——那由你和人来判断。
 human_ask、tasks_yield、tasks_complete 应作为当前一轮最后一个工具调用。
+**human_ask 会让整个运行停下来**：不只是你，所有 Agent 做完手里这一轮都停手，直到人类回答。当前这一轮不会被掐断（你写的文件照常落盘），但不会有人再开始新一轮。因此它是"只有人类能回答"时才用的工具；答案自己能查到的，别拿去占用人类。
 '''

@@ -49,7 +49,7 @@ python3 tests/run_all.py
 node --check unison/web/js/app.js   # 前端无构建步骤，语法自检即可
 ```
 
-当前 **296 个用例全部通过**。请使用 `tests/run_all.py` 而不是 `unittest discover`：后者只按模式收集文件，历史上曾让运行时最核心的 72 个用例静默地一个都没跑。
+当前 **302 个用例全部通过**。请使用 `tests/run_all.py` 而不是 `unittest discover`：后者只按模式收集文件，历史上曾让运行时最核心的 72 个用例静默地一个都没跑。
 
 ## 数据与凭据边界
 

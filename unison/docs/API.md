@@ -64,6 +64,15 @@ Unison 的服务监听 `127.0.0.1`，控制台和外部程序使用同一组端�
 ### GET /api/task?id=<id>
 单个任务的详情：`task`、`messages`、`reports`、`changes`、`events`（最近 200 条）。报告里包含 `verification_status`、`files`（含 `reason`）、`execution_records`、`omitted_files`、`evidence`、`manifest_ref`。
 
+### GET /api/transcript?run_id=<id>&limit=<n>&message_chars=<n>
+一次拿到这个运行里**每个 Agent 的可见历史**，供对话视图使用（控制台每次刷新要看全部 Agent，逐个 `/api/task` 就是 N 次往返）。返回：
+
+- `agents[]`：按"主调度在前、其余按创建顺序"排列。每项含 `id/goal/parent_id/model_id/status/created`、`messages[]`（该 Agent 的历史，`role` 为 `system`/`user`/`assistant`/`tool`，assistant 的 `tool_calls` 已展开为 `{id,name,arguments}`，tool 消息带 `tool_call_id` 可与调用配对）、`history_total` 与 `history_truncated`、`questions[]`、`unread[]`（尚未读到的消息）、`report`（最新报告的摘要字段）；
+- `hold`：`{paused, reason, waiting_on}`。`reason="human_question"` 表示**整个运行**因为某个 Agent 在等人类回答而停着，`paused` 为真时调度器不派发任何任务；
+- `questions[]` / `open_questions[]`：该运行的问题及其状态。
+
+`limit`（默认 150，上限 500）限制每个 Agent 返回的消息条数，`message_chars`（默认 8000，上限 60000）限制单条消息的字符数；两者都会在返回里标明被截断了多少。历史来自事件日志派生，与模型当时看到的完全一致。
+
 ### GET /api/events?run_id=<id>&after=<seq>&limit=<n>&types=A,B
 增量事件流。`after` 用上一次返回的最大 `seq`，即可只取增量；`types` 按事件类型过滤。SSE 版本是 `GET /api/stream?after=<seq>`，只推送最新游标。
 
@@ -247,6 +256,8 @@ Unison 的服务监听 `127.0.0.1`，控制台和外部程序使用同一组端�
 
 ### POST /api/message · /api/resume · /api/answer · /api/task/cancel · /api/runs/pause · /api/runs/resume · /api/revise · /api/archive · /api/restore · /api/compact
 分别用于：给任务发消息并唤醒、恢复失败任务、回答问题、取消任务子树、暂停/继续派发、切换目标版本、归档、从归档恢复到新目录、请求压缩上下文。参数与 `unison/server.py` 的 `dispatch()` 一致。
+
+注意 `POST /api/answer` 不只唤醒提问的那个任务：任何 Agent 调用 `human_ask` 都会**暂停整个运行**（`run.status="paused"`、`run.pause_reason="human_question"`），外部程序从 `/api/wait` 看到 `waiting` 或从 `/api/transcript` 看到 `hold.paused` 时，应当把它理解为"全体已停手，等这一句回答"；回答后运行自动回到 `active`。若该运行下还有其它未答问题，则继续停着。
 
 ## 4. 端到端示例
 

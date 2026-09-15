@@ -344,6 +344,26 @@ class Runtime:
             raise RuntimeError('执行代次或目标已失效；结果仅保留在历史记录')
         return fresh
 
+    def park(self,task,epoch,reason):
+        """运行被暂停时，把**已经在飞的那一轮**交回队列。
+
+        暂停不是失效：`current()` 对暂停中的运行返回 False，而代码里多处把这个 False
+        当成"目标变了、结果作废"。对暂停必须区别对待，否则在飞的任务会卡在 `running`——
+        调度器不领它（`current()` 为假），恢复后也轮不到它（领取要求 `queued`），
+        于是整个恢复过程少一个 Agent，且没有任何报错。
+
+        被丢弃的那一轮（模型已返回、工具还没跑）不写进历史：下一轮重跑就是。
+        已经跑完工具批次的一轮不在这里处理——它在 `_model_round` 末尾已经回到队列，
+        那一轮的工作成果照常保留。
+        """
+        fresh=self.task(task['id'])
+        if fresh['epoch']!=epoch or fresh['status']!='running': return False
+        if self.run(fresh['run_id'])['status']!='paused': return False
+        fresh['status']='queued'; fresh['not_before']=now()
+        self.store.put('task',fresh)
+        self.store.event('TaskParked',{'reason':reason},fresh)
+        return True
+
     def backfill_message_log(self,task,cached):
         """把缓存里已有、但日志还没记的消息补进日志（保持顺序）。
 
@@ -396,7 +416,7 @@ class Runtime:
         app_config=configs[-1] if configs else {}
         run = {'id':uid('run_'),'goal':goal,'revision':1,'workspace':str(Path(workspace).expanduser().resolve()),
                'model_id':model_id,'review_model_id':app_config.get('review_model_id'),
-               'features':app_config.get('features',{}),'status':'active','created':now()}
+               'features':app_config.get('features',{}),'status':'active','pause_reason':'','created':now()}
         warning=self.workspace_inside_data_dir(run['workspace'])
         if warning: run['workspace_warning']=warning
         with self.store.transaction():
@@ -460,6 +480,17 @@ class Runtime:
         # 技能作业同样不重放：上次运行中途中断的调用只标记，由调用方重新提交。
         self.skill_invoker.recover()
         with self.store.transaction():
+            for run in self.store.all('run'):
+                # 升级期规则：旧记录没有 pause_reason 字段。若它停在 paused 且确实有未答问题，
+                # 就按"等待人类回答"处理（回答到达即放行）；没有未答问题的暂停算人工暂停，不去碰。
+                if run['status']!='paused' or run.get('pause_reason'):
+                    run.setdefault('pause_reason',''); self.store.put('run',run)
+                    continue
+                if any(q['run_id']==run['id'] and q['status']=='open' for q in self.store.all('question')):
+                    run['pause_reason']='human_question'
+                else:
+                    run['pause_reason']='manual'
+                self.store.put('run',run)
             for t in self.store.all('task'):
                 if t['status']=='running':
                     uncertain = self.store.db.execute("SELECT id,name FROM calls WHERE task_id=? AND status='running'",(t['id'],)).fetchall()
@@ -859,16 +890,21 @@ class Runtime:
                         raise RuntimeError('有效上下文仍超过模型窗口；请增大窗口或进一步精简目标/工具。原始日志已保留。')
                 keep_running=await self._model_round(t,epoch)
                 if not keep_running:
+                    self.park(self.task(id),epoch,'run-paused')
                     return
                 fresh=self.task(id)
                 if fresh['epoch']!=epoch or not self.current(fresh) or fresh['status']!='running':
+                    self.park(fresh,epoch,'run-paused')
                     return
             raise RuntimeError('单次调度内连续压缩次数过多；请检查目标与工具规模。原始日志已保留。')
         except asyncio.CancelledError:
             pass
         except Exception as e:
             fresh=self.task(id)
-            if fresh['epoch']==epoch and fresh['status'] not in TERMINAL: self.fail(fresh,describe_error(e))
+            if fresh['epoch']==epoch and fresh['status'] not in TERMINAL:
+                # 暂停期间 guard/compact 抛的错不是"这个任务失败了"，是"这轮先别做"。
+                if self.park(fresh,epoch,'run-paused'): return
+                self.fail(fresh,describe_error(e))
 
     def _over_window(self,t):
         config=self.store.get('model',t['model_id'])
@@ -889,6 +925,8 @@ class Runtime:
                                             run_id=t['run_id'],task_id=t['id'])
         fresh=self.task(t['id'])
         if fresh['epoch']!=epoch or not self.current(fresh):
+            # 暂停中的运行也走这条路（`current()` 为假）：把任务交回队列而不是丢在 running。
+            if self.park(fresh,epoch,'run-paused'): return False
             self.store.event('LateModelResult',{'epoch':epoch,'message':msg,'usage':usage},t)
             return False
         t=self.guard(t,epoch)
@@ -1250,6 +1288,8 @@ class Runtime:
             for q in self.store.all('question'):
                 if q['task_id']==id and q['status']=='open':
                     q['status']='obsolete'; self.store.put('question',q)
+            # 取消掉提问题的那个人之后，这个问题永远不会被回答了：别让整个运行陪着一起停。
+            self.release_human_pause(t['run_id'])
 
     def revise(self,run_id,goal):
         run=self.run(run_id)
@@ -1261,7 +1301,7 @@ class Runtime:
             self.store.event('GoalChangeReceived',{'goal':goal},run_id=run_id,revision=previous)
             root=self.task(run['root_task'])
             self.cancel_task(root['id'],'superseded')
-            run.update(goal=goal,revision=previous+1,status='active')
+            run.update(goal=goal,revision=previous+1,status='active',pause_reason='')
             self.store.put('run',run)
             self.store.put('revision',{'id':run_id+':'+str(run['revision']),'run_id':run_id,'revision':run['revision'],'goal':goal,'created':now()})
             for k in self.store.all('knowledge'):
@@ -1283,6 +1323,9 @@ class Runtime:
         with self.store.transaction():
             q.update(status='answered',answer=answer); self.store.put('question',q)
             self.store.event('HumanAnswered',q,t)
+            # 先放行再投递：暂停期间 `deliver` 的唤醒会走 `current()` 判断，
+            # 运行还没回到 active 的话，回答就送不进那个等待中的任务。
+            self.release_human_pause(run['id'])
             self.deliver(t['id'],'用户回答：'+answer,delivery='wake',topic='question:'+id,kind='answer')
         return q
 
@@ -1303,12 +1346,50 @@ class Runtime:
             return run
         if run['status']!='active':
             raise ValueError('只有运行中的 run 可以暂停')
-        run['status']='paused'; self.store.put('run',run)
+        run['status']='paused'; run['pause_reason']='manual'; self.store.put('run',run)
         for t in self.store.all('task'):
             if t['run_id']==id and t['status']=='running':
                 self.interrupt(t['id']); t['epoch']+=1; t['status']='queued'; self.repair_history(t); self.store.put('task',t)
-        self.store.event('RunPaused',{},run_id=id,revision=run['revision'])
+        self.store.event('RunPaused',{'reason':'manual'},run_id=id,revision=run['revision'])
         return run
+
+    def hold_for_human(self,task,question):
+        """一个 Agent 向人类提问 = 整个运行停下来等这一句回答。
+
+        为什么是**整个 run** 而不是提问的那一个任务：人类是这次协作唯一的输入源，
+        一个问题悬着的时候，其他 Agent 继续烧 token 只会基于"还没定的事"往下做，
+        而回答一到，它们手里的判断就作废了。所以要停就一起停。
+
+        停法是**软停**：正在跑的那一轮工具批次照常做完（它可能已经写了一半文件，
+        从中间掐断会留下 `TOOL_OUTCOME_UNKNOWN`），然后回到队列；调度器因为
+        `run['status']!='active'`（见 `current()`）不再领取任何任务，于是没有 Agent 会开始新一轮。
+        回答到达时由 `release_human_pause()` 放行。
+        """
+        run=self.run(task['run_id'])
+        if run['status']!='active':
+            # 已经因为别的问题（或人工暂停）停着了，不覆盖既有原因。
+            return False
+        run['status']='paused'; run['pause_reason']='human_question'; self.store.put('run',run)
+        self.store.event('RunPaused',{'reason':'human_question','question_id':question['id'],
+                                      'task_id':task['id'],'goal':task.get('goal')},
+                         run_id=run['id'],revision=run['revision'])
+        return True
+
+    def release_human_pause(self,run_id):
+        """人类问题造成的暂停：该运行下再没有未答问题时才解除。
+
+        多个问题可能同时在（并发提问），所以判据是"还剩几个 open"，而不是"刚答的这个"。
+        """
+        run=self.run(run_id)
+        if run.get('pause_reason')!='human_question' or run['status']!='paused':
+            return False
+        still_open=[q['id'] for q in self.store.all('question')
+                    if q['run_id']==run_id and q['status']=='open']
+        if still_open:
+            return False
+        run['status']='active'; run['pause_reason']=''; self.store.put('run',run)
+        self.store.event('RunResumed',{'reason':'human-answered'},run_id=run_id,revision=run['revision'])
+        return True
 
     def resume_run(self,id):
         run=self.run(id)
@@ -1317,8 +1398,10 @@ class Runtime:
         if run['status']!='paused':
             raise ValueError('只有暂停的 run 可以恢复')
         self.check_workspace_available(run['workspace'],run['id'])
-        run['status']='active'; self.store.put('run',run)
-        self.store.event('RunResumed',{},run_id=id,revision=run['revision'])
+        reason=run.get('pause_reason') or 'manual'
+        # 人工点"继续运行"是显式覆盖：即使还有问题没答，也按人的意思放行。
+        run['status']='active'; run['pause_reason']=''; self.store.put('run',run)
+        self.store.event('RunResumed',{'reason':'manual','overrode':reason},run_id=id,revision=run['revision'])
         return run
 
     async def compact(self,t,epoch):
@@ -1827,7 +1910,10 @@ class Runtime:
             self.store.put('question',q); self.store.event('QuestionRaised',q,t)
             t.update(status='waiting',wait={'topics':['question:'+q['id']],'task_ids':[], 'after_cursor':self.store.cursor(),'mode':'any'})
             self.store.put('task',t)
-        return {'question_id':q['id'],'waiting':True}
+            # 向人类提问 = 整个运行暂停，直到这句话被回答（见 hold_for_human）。
+            self.hold_for_human(t,q)
+        return {'question_id':q['id'],'waiting':True,'run_paused':True,
+                'note':'整个运行已暂停：所有 Agent 做完当前这一轮就停手，人类回答后自动继续。'}
     async def tool_workspace_list(self,t,a):
         p=self.resolve_path(t,a.get('path','.'))
         return [{'name':x.name,'directory':x.is_dir()} for x in sorted(p.iterdir()) if x.name not in {'.git','.unison'}][:500]

@@ -23,7 +23,7 @@ const state = {
 
 const view = {
   runId: null,
-  tab: 'overview',
+  tab: 'chat',
   filter: 'all',
   search: '',
   replayCursor: null,
@@ -31,6 +31,8 @@ const view = {
   streamLimit: 120,
   eventFilter: '',
   knowledgeQuery: '',
+  agentTask: null,
+  jumpedQuestions: new Set(),
   drawer: null, // { kind: 'task' | 'blob' | 'skill', ... }
   lastArchive: null,
   refreshError: '',
@@ -69,6 +71,7 @@ function invalidate(prefix = '') {
 
 const eventsOf = (runId) => cached(`events:${runId}`, () => api.get('events', { run_id: runId, limit: MAX_EVENTS }));
 const filesOf = (runId) => cached(`files:${runId}`, () => api.get('files', { run_id: runId }));
+const transcriptOf = (runId) => cached(`transcript:${runId}`, () => api.get('transcript', { run_id: runId, limit: 150 }));
 const knowledgeOf = (runId, query) => cached(`knowledge:${runId}:${query || ''}`, () => api.get('knowledge', { run_id: runId, query: query || '' }));
 const taskOf = (taskId) => cached(`task:${taskId}`, () => api.get('task', { id: taskId }));
 const replayOf = (runId, until) => cached(`replay:${runId}:${until}`, () => api.get('replay', { run_id: runId, until }));
@@ -86,8 +89,31 @@ const openQuestions = () => {
   return run ? state.questions.filter((question) => question.run_id === run.id && question.status === 'open') : [];
 };
 
-function visibleRuns() {
-  const query = view.search.trim().toLowerCase();
+/**
+ * 有 Agent 向人类提问时，自动跳到**那个 Agent 的对话页**。
+ *
+ * 为什么值得自动跳：提问会让整个运行停住（`human_ask` = 全体暂停），
+ * 而此时人可能在别的任务、别的标签页上看别的东西——没有这一步，
+ * "整个系统停着等人"这件事就只体现在状态里，得靠人自己发现。
+ *
+ * `jumpedQuestions` 记住已经跳过的提问，避免每次刷新都把用户拽回去；
+ * 问题被回答/作废后自动从集合里移除，相同 id 不会再出现（问题 id 不复用）。
+ */
+function jumpToWaitingQuestion() {
+  const open = state.questions.filter((question) => question.status === 'open');
+  const openIds = new Set(open.map((question) => question.id));
+  for (const id of [...view.jumpedQuestions]) if (!openIds.has(id)) view.jumpedQuestions.delete(id);
+  const fresh = open.find((question) => !view.jumpedQuestions.has(question.id));
+  for (const question of open) view.jumpedQuestions.add(question.id);
+  if (!fresh) return;
+  const run = state.runs.find((item) => item.id === fresh.run_id);
+  if (run) view.runId = run.id;
+  view.tab = 'chat';
+  view.agentTask = fresh.task_id;
+  toast('有 Agent 在等你回答：已跳到它的对话，整个运行已暂停', 'warn', 8000);
+}
+
+function visibleRuns() {  const query = view.search.trim().toLowerCase();
   const filter = views.FILTERS.find((item) => item.id === view.filter) || views.FILTERS[0];
   return state.runs
     .filter((run) => (filter.id === 'all' ? true : filter.match.includes(run.status)))
@@ -119,7 +145,22 @@ async function renderMain() {
   let body = '';
 
   try {
-    if (view.tab === 'overview') {
+    if (view.tab === 'chat') {
+      const data = await transcriptOf(run.id);
+      if (epoch !== viewEpoch) return;
+      const agents = data.agents || [];
+      const openQuestions = data.open_questions || [];
+      const holds = new Set(openQuestions.map((question) => question.task_id));
+      // 谁会先被看到：有问题的 Agent 优先，其次主调度。这样"有人在等回答"的运行时，
+      // 一进对话页就是那个正在等你的 Agent，而不是需要用户自己去找。
+      if (!view.agentTask || !agents.some((agent) => agent.id === view.agentTask)) {
+        const waiting = agents.find((agent) => holds.has(agent.id));
+        view.agentTask = waiting ? waiting.id : (agents[0]?.id || null);
+      }
+      counts.chat = openQuestions.length || null;
+      body = views.renderAgentTabs({ agents, selected: view.agentTask, questions: data.questions })
+        + views.renderConversation({ run, agent: agents.find((agent) => agent.id === view.agentTask), agents, questions: data.questions, selected: view.agentTask });
+    } else if (view.tab === 'overview') {
       const [events, detail] = await Promise.all([
         eventsOf(run.id),
         run.root_task ? taskOf(run.root_task).catch(() => null) : Promise.resolve(null),
@@ -169,7 +210,15 @@ async function renderMain() {
 
   if (epoch !== viewEpoch) return;
 
-  const questionsHtml = views.renderQuestions(openQuestions(), currentTasks());
+  // 运行被人类问题挂起时，用一条自带解释的横幅代替普通问题列表：
+  // 停的是全体 Agent，这个因果必须写在用户看得见的地方。
+  const hold = views.renderHoldBanner({
+    run,
+    questions: openQuestions(),
+    agents: currentTasks(),
+    selected: view.agentTask,
+  });
+  const questionsHtml = hold ? '' : views.renderQuestions(openQuestions(), currentTasks());
   const archiveBanner = view.lastArchive
     ? `<div class="banner"><div class="banner-main"><h4>已归档</h4><div class="banner-body mono">${esc(view.lastArchive)}</div></div>
        <button class="btn sm" data-action="restore" data-path="${attr(view.lastArchive)}">恢复到新目录</button>
@@ -178,6 +227,7 @@ async function renderMain() {
 
   host.innerHTML = `<div class="main-inner">
     ${views.renderRunHeader(run)}
+    ${hold}
     ${archiveBanner}
     ${questionsHtml}
     ${views.renderTabs(view, counts)}
@@ -201,6 +251,7 @@ async function refresh() {
         if (!view.runId || !state.runs.some((run) => run.id === view.runId)) {
           view.runId = state.runs.length ? state.runs[state.runs.length - 1].id : null;
         }
+        jumpToWaitingQuestion();
         setConnection('online');
         renderChrome();
         await renderMain();
@@ -333,9 +384,18 @@ const actions = {
     view.replayCursor = null;
     view.showAllStream = false;
     view.eventFilter = '';
+    view.agentTask = null;
     closeDrawer();
     renderChrome();
     renderMain();
+  },
+
+  'agent-tab': async (el) => {
+    view.agentTask = el.dataset.task;
+    // 从横幅或问题列表点进来时，也要落到对话页——跳过去却停在别的标签页等于没跳。
+    view.tab = 'chat';
+    await renderMain();
+    $('#tab-panel')?.scrollIntoView({ block: 'start', behavior: 'smooth' });
   },
 
   filter: (el) => {

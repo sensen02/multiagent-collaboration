@@ -141,6 +141,7 @@ export function renderQuestions(questions, tasks) {
 
 export function renderTabs(view, counts) {
   const tabs = [
+    ['chat', '对话'],
     ['overview', '总览'],
     ['graph', '协作图'],
     ['stream', '轨迹'],
@@ -151,7 +152,9 @@ export function renderTabs(view, counts) {
   return `<div class="tabs" role="tablist" aria-label="运行视图">${tabs
     .map(([id, label]) => {
       const count = counts?.[id];
-      return `<button class="tab" role="tab" aria-selected="${view.tab === id}" data-action="tab" data-tab="${id}">${esc(label)}${count ? `<span class="tab-count">${count}</span>` : ''}</button>`;
+      // 对话页的计数是"有几个问题在等人"，所以它需要能被一眼看见，而不是一个灰数字。
+      const attention = id === 'chat' && count ? ' attn' : '';
+      return `<button class="tab${attention}" role="tab" aria-selected="${view.tab === id}" data-action="tab" data-tab="${id}">${esc(label)}${count ? `<span class="tab-count">${count}</span>` : ''}</button>`;
     })
     .join('')}</div>`;
 }
@@ -562,8 +565,416 @@ function renderEntry(entry) {
     </div></div>`;
 }
 
-/* ----------------------------------------------------------------- 文件 */
+/* ----------------------------------------------------------------- 对话 */
 
+/**
+ * 对话视图：一个 Agent 一页，内容是**它当时真正看到与说出的东西**
+ * （服务端 `/api/transcript` 给的是事件日志派生出来的历史，不是另抄一份）。
+ *
+ * 与「轨迹」页的分工：轨迹是事件流，按事件类型铺开、带原始负载，用来查证；
+ * 这里是对话，工具调用被翻成一句人话（"执行命令 npm test → 退出码 0"），
+ * 用来读懂"这个 Agent 在干什么、卡在哪、要什么"。原始负载仍然收在折叠块里，一个字没丢。
+ */
+
+const TOOL_LABELS = {
+  models_list: '查看可用模型',
+  models_credentials: '读取模型凭据',
+  tasks_list: '查看任务列表',
+  tasks_submit: '委派子任务',
+  tasks_yield: '挂起等待',
+  agents_send: '给其它 Agent 发消息',
+  tasks_close: '收束任务并排空请求',
+  tasks_cancel: '取消任务',
+  human_ask: '向人类提问',
+  workspace_list: '列出目录',
+  workspace_read: '读取文件',
+  workspace_image_info: '读取图片信息',
+  workspace_write: '写入文件',
+  workspace_edit: '精确编辑文件',
+  workspace_shell: '执行命令',
+  workspace_diff: '查看文件差异',
+  workspace_integrate: '集成子任务成果',
+  workspace_archive: '归档本次运行',
+  workspace_restore: '从归档恢复',
+  artifacts_read: '读取工具原文',
+  knowledge_search: '检索共享知识',
+  knowledge_read: '读取共享信息',
+  broadcast: '发布共享信息',
+  skill: '加载技能',
+  skills_list: '查看技能目录',
+  usage_report: '查看用量与额度',
+  context_compact: '压缩工作上下文',
+  goals_activate_revision: '切换目标版本',
+  tasks_complete: '提交结果',
+};
+
+function toolArgs(raw) {
+  if (raw === undefined || raw === null || raw === '') return {};
+  if (typeof raw === 'object') return raw;
+  try {
+    const value = JSON.parse(raw);
+    return value && typeof value === 'object' ? value : { value };
+  } catch {
+    return { raw: String(raw) };
+  }
+}
+
+/** 把调用参数压成一句"它在对谁做什么"，对话页读的就是这一行。 */
+export function toolTarget(name, raw) {
+  const args = toolArgs(raw);
+  const text = (value, max = 120) => (value === undefined || value === null ? '' : truncate(String(value), max));
+  if (args.error || args.raw) return text(args.error || args.raw, 160);
+  switch (name) {
+    case 'workspace_shell': return text(args.command, 200);
+    case 'workspace_read':
+    case 'workspace_write':
+    case 'workspace_edit':
+    case 'workspace_list':
+    case 'workspace_diff':
+    case 'workspace_image_info': return text(args.path, 120);
+    case 'tasks_submit': return `${text(args.model_id || '继承本模型', 40)}：${text(args.goal, 100)}`;
+    case 'agents_send': return `→ ${text(args.task_id, 24)}：${text(args.summary, 100)}`;
+    case 'tasks_cancel':
+    case 'tasks_close': return text(args.source_task || args.task_id, 40);
+    case 'tasks_yield': {
+      const ids = (args.task_ids || []).join('、');
+      const topics = (args.topics || []).join('、');
+      const until = args.timeout_seconds || args.max_wait_seconds;
+      return [ids ? `任务 ${text(ids, 60)}` : '', topics ? `主题 ${text(topics, 60)}` : '',
+        until ? `${until} 秒后到期` : '只被事件唤醒'].filter(Boolean).join(' · ') || '等待';
+    }
+    case 'human_ask': return text(args.question, 160);
+    case 'knowledge_search': return text(args.query, 80) || `scope=${text(args.scope, 20)}`;
+    case 'knowledge_read': return text(args.id, 40) || `scope=${text(args.scope || 'run', 20)} from_seq=${text(args.from_seq ?? 0, 10)}`;
+    case 'broadcast': return text(args.title, 80) || text(args.content, 120);
+    case 'skill': return `${text(args.name, 40)}${args.batch ? `（批量 ${args.batch.length} 份）` : ''}`;
+    case 'workspace_integrate': return text(args.source_task, 40);
+    case 'tasks_complete': return text(args.summary, 140);
+    case 'models_credentials': return (args.model_ids || []).join('、') || '全部模型';
+    case 'workspace_restore': return text(args.archive_path, 60);
+    default: {
+      const first = Object.values(args).find((value) => typeof value === 'string' && value.trim());
+      return text(first, 120);
+    }
+  }
+}
+
+/** 结果同样翻成人话；原始 JSON 由 `jsonBlock` 收在折叠块里。 */
+export function toolOutcome(result) {
+  if (result === undefined || result === null) return { text: '没有记录结果', tone: '' };
+  if (typeof result === 'string') return { text: truncate(result.trim() || '（空）', 300), tone: '' };
+  if (typeof result !== 'object') return { text: String(result), tone: '' };
+  if (Array.isArray(result)) return { text: `返回 ${result.length} 项`, tone: 'is-ok' };
+  if (result.error) return { text: truncate(String(result.error), 300), tone: 'is-error' };
+  if (result.question_id) return { text: '已提问 · 整个运行暂停，等人类回答', tone: 'is-wait' };
+  if (result.exit_code !== undefined) {
+    const tail = String(result.output || '').trim().split('\n').filter(Boolean).slice(-2).join(' / ');
+    return {
+      text: `退出码 ${result.exit_code}${result.timed_out ? '（超时被终止）' : ''}${tail ? ` · ${truncate(tail, 180)}` : ''}`,
+      tone: result.exit_code === 0 ? 'is-ok' : 'is-error',
+    };
+  }
+  if (result.written) return { text: `已写入 ${truncate(result.written, 120)}`, tone: 'is-ok' };
+  if (result.edited) return { text: `已编辑 ${truncate(result.edited, 120)}`, tone: 'is-ok' };
+  if (result.waiting !== undefined) return { text: result.waiting ? '已挂起，等事件唤醒' : '无需等待', tone: '' };
+  if (result.completed) return { text: '已提交结果', tone: 'is-ok' };
+  if (result.integrated !== undefined) {
+    return { text: result.integrated ? '集成成功' : '未集成（冲突或需重试）', tone: result.integrated ? 'is-ok' : 'is-error' };
+  }
+  if (result.task_id) return { text: `子任务 ${truncate(result.task_id, 40)}`, tone: 'is-ok' };
+  if (result.total_lines !== undefined) return { text: `读出 ${result.total_lines} 行中的第 ${result.start || 1} 行起`, tone: 'is-ok' };
+  if (result.format) return { text: `${result.format}${result.width ? ` ${result.width}×${result.height}` : ''}${result.bytes ? ` · ${result.bytes} 字节` : ''}`, tone: 'is-ok' };
+  if (result.entries) return { text: `返回 ${result.entries.length} 条`, tone: 'is-ok' };
+  if (result.ok !== undefined) return { text: result.ok ? '执行成功' : truncate(String(result.error || result.message || '执行失败'), 200), tone: result.ok ? 'is-ok' : 'is-error' };
+  const keys = Object.keys(result);
+  if (!keys.length) return { text: '（空结果）', tone: '' };
+  return { text: keys.slice(0, 5).join('、'), tone: '' };
+}
+
+/** 任务简报是 JSON；把它拆开显示，比让模型的一整段机器可读文本占满屏幕有用。 */
+function parseBrief(content) {
+  if (typeof content !== 'string' || !content.trim().startsWith('{')) return null;
+  try {
+    const data = JSON.parse(content);
+    return data && typeof data === 'object' && data.goal && data.task_id ? data : null;
+  } catch {
+    return null;
+  }
+}
+
+const INBOX_MARKER = '收件箱批次：';
+
+function parseInbox(content) {
+  if (typeof content !== 'string') return null;
+  const at = content.indexOf(INBOX_MARKER);
+  if (at < 0) return null;
+  try {
+    const items = JSON.parse(content.slice(at + INBOX_MARKER.length));
+    return Array.isArray(items) ? items : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 把一条条消息编成对话块：assistant 的工具调用与它的结果合并成一张卡片
+ * （服务端历史里它们是两条消息，直接铺开会读成"调用一次、结果一次"两段不相干的东西）。
+ */
+export function buildConversation(messages = []) {
+  const blocks = [];
+  const calls = new Map();
+  messages.forEach((message, index) => {
+    if (message.role === 'system') {
+      blocks.push({ kind: 'system', index, text: message.content || '' });
+      return;
+    }
+    if (message.role === 'user') {
+      const brief = parseBrief(message.content);
+      if (brief && !blocks.some((block) => block.kind === 'brief')) {
+        blocks.push({ kind: 'brief', index, brief, raw: message.content });
+        return;
+      }
+      const inbox = parseInbox(message.content);
+      if (inbox) {
+        blocks.push({ kind: 'inbox', index, items: inbox });
+        return;
+      }
+      blocks.push({ kind: 'user', index, text: message.content || '' });
+      return;
+    }
+    if (message.role === 'assistant') {
+      const block = { kind: 'assistant', index, text: message.content || '', reasoning: message.reasoning || '', calls: [] };
+      for (const call of message.tool_calls || []) {
+        const entry = { id: call.id, name: call.name, args: call.arguments, result: undefined };
+        block.calls.push(entry);
+        if (call.id) calls.set(call.id, entry);
+      }
+      blocks.push(block);
+      return;
+    }
+    if (message.role === 'tool') {
+      const entry = calls.get(message.tool_call_id);
+      if (entry) entry.result = message.content;
+      else blocks.push({ kind: 'orphan', index, text: message.content || '' });
+    }
+  });
+  return blocks;
+}
+
+function toolCard(name, argsRaw, resultRaw) {
+  const outcome = toolOutcome(resultRaw === undefined ? undefined : safeParse(resultRaw));
+  const pending = resultRaw === undefined;
+  return `<div class="tool-card" data-state="${pending ? 'pending' : (outcome.tone === 'is-error' ? 'error' : 'done')}">
+    <div class="tool-head">
+      <span class="tool-ico" aria-hidden="true">⚙</span>
+      <span class="tool-label">${esc(TOOL_LABELS[name] || name || '未知工具')}</span>
+      <code class="tool-target">${esc(toolTarget(name, argsRaw) || '—')}</code>
+      <span class="tool-out ${outcome.tone}">${esc(pending ? '执行中…' : outcome.text)}</span>
+    </div>
+    ${jsonBlock(toolArgs(argsRaw), { label: '调用参数' })}
+    ${resultRaw === undefined ? '' : jsonBlock(safeParse(resultRaw), { label: '原始结果' })}
+  </div>`;
+}
+
+function safeParse(raw) {
+  if (typeof raw !== 'string') return raw;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    return raw;
+  }
+}
+
+/** Agent 标签条：主调度在最前，其余按创建顺序；有未答问题时标红点。 */
+export function renderAgentTabs({ agents, selected, questions }) {
+  const open = new Map();
+  for (const question of questions || []) {
+    if (question.status === 'open') open.set(question.task_id, (open.get(question.task_id) || 0) + 1);
+  }
+  const rows = agents.map((agent, index) => {
+    const role = agent.parent_id ? 'child' : 'root';
+    const waiting = open.get(agent.id) || 0;
+    const meta = statusOf(agent.status);
+    const label = role === 'root' ? '主调度' : `子 AGENT ${index}`;
+    return `<button class="agent-tab" role="tab" aria-selected="${agent.id === selected}" data-action="agent-tab" data-task="${attr(agent.id)}">
+      <span class="agent-avatar" data-role="${role}">${role === 'root' ? '主' : '子'}</span>
+      <span class="agent-tab-main">
+        <span class="agent-tab-name">${esc(label)}${waiting ? `<span class="agent-badge" title="等人类回答">${waiting}</span>` : ''}</span>
+        <span class="agent-tab-goal">${esc(truncate(agent.goal || '', 46))}</span>
+      </span>
+      <span class="agent-tab-state" data-tone="${waiting ? 'waiting' : meta.tone}">${esc(waiting ? '等你回答' : meta.label)}</span>
+    </button>`;
+  });
+  return `<div class="agent-tabs" role="tablist" aria-label="Agent 对话">${rows.join('')}</div>`;
+}
+
+function questionCard(question, { compact = false } = {}) {
+  const options = (question.options || []).length
+    ? `<div class="row wrap" style="margin-bottom:10px">${question.options
+        .map((option) => `<button class="btn sm" data-action="answer" data-question="${attr(question.id)}" data-answer="${attr(option)}">${esc(option)}</button>`)
+        .join('')}</div>`
+    : '';
+  return `<div class="question-card${compact ? ' inline' : ''}">
+    <div class="row wrap tiny muted">
+      <span class="mono">${esc(question.id)}</span>
+      <span>${esc(stamp(question.created))}</span>
+    </div>
+    <div class="q-text">${rich(question.question)}</div>
+    ${options}
+    <form class="q-form" data-action="answer-form" data-question="${attr(question.id)}">
+      <input name="answer" placeholder="输入你的回答（回答后所有 Agent 继续）" required aria-label="回答该问题" autocomplete="off">
+      <button class="btn primary" type="submit">回答并继续</button>
+    </form>
+  </div>`;
+}
+
+/**
+ * 整个运行被人类问题挂起时的横幅：说清"停的是全体、等的是哪一句、回答后会发生什么"。
+ * 这是自动暂停对用户唯一可见的地方，所以它必须自己解释清楚。
+ */
+export function renderHoldBanner({ run, questions, agents, selected }) {
+  if (!run || run.status !== 'paused' || run.pause_reason !== 'human_question') return '';
+  const list = questions || [];
+  if (!list.length) return '';
+  const byId = new Map((agents || []).map((agent) => [agent.id, agent]));
+  return `<div class="hold-banner" role="status">
+    <div class="hold-head">
+      <span class="hold-dot" aria-hidden="true"></span>
+      <div>
+        <h4>所有 Agent 已暂停：等待人类回答</h4>
+        <p class="tiny">${list.length} 个问题未答。回答后整个运行自动继续；也可以点右上角「继续运行」直接放行（问题会被跳过）。</p>
+      </div>
+    </div>
+    ${list.map((question) => {
+      const agent = byId.get(question.task_id);
+      const role = agent ? (agent.parent_id ? '子 AGENT' : '主调度') : '未知 Agent';
+      return `<div class="hold-item">
+        <button class="hold-jump" data-action="agent-tab" data-task="${attr(question.task_id)}">${esc(role)} · ${esc(truncate(agent?.goal || question.task_id, 40))}${question.task_id === selected ? '（当前）' : ' →'}</button>
+        <div class="q-text">${rich(question.question)}</div>
+        <form class="q-form" data-action="answer-form" data-question="${attr(question.id)}">
+          <input name="answer" placeholder="输入你的回答" required aria-label="回答该问题" autocomplete="off">
+          <button class="btn primary" type="submit">回答并继续</button>
+        </form>
+      </div>`;
+    }).join('')}
+  </div>`;
+}
+
+/** 单个 Agent 的完整对话页。 */
+export function renderConversation({ run, agent, agents, questions, selected }) {
+  if (!agent) {
+    return `<div class="card"><div class="empty"><h3>这个运行还没有可显示的 Agent</h3><p>创建任务后，主调度 Agent 的对话会出现在这里。</p></div></div>`;
+  }
+  const role = agent.parent_id ? 'child' : 'root';
+  const openQuestions = (agent.questions || []).filter((question) => question.status === 'open');
+  const answered = (agent.questions || []).filter((question) => question.status === 'answered');
+  const blocks = buildConversation(agent.messages || []);
+  const root = (agents || []).find((item) => !item.parent_id);
+
+  const meta = [
+    pill(agent.status),
+    `<span class="mono tiny">${esc(agent.id)}</span>`,
+    agent.model_id ? quietPill(agent.model_id) : '',
+    role === 'child' && root ? `<span class="tiny muted">上级 ${esc(truncate(root.goal || '', 40))}</span>` : '',
+    role === 'root' ? `<span class="path" title="${attr(run?.workspace || '')}">${esc(run?.workspace || '')}</span>` : '',
+    `<span class="tiny muted">${blocks.filter((block) => block.kind === 'assistant').length} 轮模型回复 · 消息 ${agent.history_total ?? (agent.messages || []).length}</span>`,
+  ].filter(Boolean).join('');
+
+  const unread = (agent.unread || []).length;
+  const truncated = agent.history_truncated
+    ? `<div class="note tiny">为保持界面流畅，这里只显示最近 ${(agent.messages || []).length} 条消息（更早的 ${agent.history_truncated} 条仍在事件日志里，可用「轨迹」页查证）。</div>`
+    : '';
+
+  const waitNote = agent.wait
+    ? `<div class="note tiny">等待条件：${esc((agent.wait.task_ids || []).join('、') || '—')} · 主题 ${esc((agent.wait.topics || []).join('、') || '—')} · ${esc(agent.wait.mode || 'any')}${agent.wait.deadline ? ` · ${esc(stamp(agent.wait.deadline))} 到期` : ' · 只被事件唤醒'}</div>`
+    : '';
+
+  const report = agent.report
+    ? `<div class="card chat-report">
+        <div class="card-head"><h3>${role === 'root' ? '最终报告' : '交付结果'}</h3><span class="spacer"></span>${agent.report.verification_status ? quietPill(VERDICT[agent.report.verification_status]?.label || agent.report.verification_status) : ''}</div>
+        <div class="card-body">
+          <div class="msg-body">${rich(agent.report.summary || agent.result || '')}</div>
+          ${Object.keys(agent.report.files || {}).length ? `<div class="tiny muted" style="margin-top:8px">涉及文件：${esc(Object.keys(agent.report.files).join('、'))}</div>` : ''}
+          ${(agent.report.unknowns || []).length ? `<div class="note warn tiny" style="margin-top:8px">未解决项：${esc(agent.report.unknowns.join('；'))}</div>` : ''}
+        </div>
+      </div>`
+    : '';
+
+  const errorNote = agent.error ? `<div class="banner error"><div class="banner-main"><h4>这个 Agent 出错了</h4><div class="banner-body">${esc(agent.error)}</div></div></div>` : '';
+
+  return `<div class="chat">
+    <div class="chat-head">
+      <span class="agent-avatar lg" data-role="${role}">${role === 'root' ? '主' : '子'}</span>
+      <div class="chat-ident">
+        <h3>${role === 'root' ? '主调度 Agent' : '子 AGENT'} <span class="tiny muted">${role === 'root' ? '（负责统筹与最终交付）' : '（独立工作副本，可继续委派）'}</span></h3>
+        <div class="chat-meta">${meta}</div>
+      </div>
+    </div>
+    <div class="chat-goal">${esc(agent.goal || '')}</div>
+    ${unread ? `<div class="note tiny">还有 ${unread} 条消息没被这个 Agent 读到（下一轮会读到）。</div>` : ''}
+    ${waitNote}
+    ${errorNote}
+    ${openQuestions.map((question) => questionCard(question, { compact: true })).join('')}
+    <div class="chat-log">${blocks.length ? blocks.map(renderBlock).join('') : '<div class="empty"><p>这个 Agent 还没有开始说话。</p></div>'}</div>
+    ${answered.length ? `<div class="chat-answered"><h4>已回答过的问题</h4>${answered.map((question) => `<div class="qa">
+        <div class="q-text">${rich(question.question)}</div>
+        <div class="a-text">你：${rich(question.answer || '')}</div>
+      </div>`).join('')}</div>` : ''}
+    ${truncated}
+    ${report}
+  </div>`;
+}
+
+function renderBlock(block) {
+  if (block.kind === 'system') {
+    return `<details class="raw msg-system"><summary>系统提示 · ${esc(String(block.text || '').length)} 字符（模型每次调用都会看到）</summary><pre class="code scroll">${esc(block.text || '')}</pre></details>`;
+  }
+  if (block.kind === 'brief') {
+    const brief = block.brief;
+    const knowledge = Array.isArray(brief.knowledge_index) ? brief.knowledge_index.length : 0;
+    return `<div class="msg brief">
+      <div class="msg-avatar">任</div>
+      <div class="msg-body">
+        <div class="msg-tag">任务简报</div>
+        <div class="brief-goal">${esc(brief.goal || '')}</div>
+        <div class="tiny muted">工作区 <span class="mono">${esc(brief.workspace || '')}</span> · 目标版本 r${esc(brief.goal_revision ?? 1)}${knowledge ? ` · 相关项目知识 ${knowledge} 条` : ''}${brief.review_model_id ? ` · 审查模型 ${esc(brief.review_model_id)}` : ''}</div>
+        ${jsonBlock(brief, { label: '简报原文' })}
+      </div></div>`;
+  }
+  if (block.kind === 'inbox') {
+    return `<div class="msg inbox">
+      <div class="msg-avatar">✉</div>
+      <div class="msg-body">
+        <div class="msg-tag">收到的消息（${block.items.length} 条）</div>
+        ${block.items.map((item) => `<div class="inbox-item">
+          <div class="inbox-head"><span class="mono tiny">${esc(item.from_task || '系统')}</span>
+            <span class="tiny muted">${esc(item.kind || 'message')}${item.request_id ? ` · 请求 ${esc(item.request_id)}` : ''}${item.in_reply_to ? ` · 答复 ${esc(item.in_reply_to)}` : ''}${item.hop > 1 ? ` · 转发第 ${esc(item.hop)} 跳` : ''}</span></div>
+          <div class="inbox-summary">${rich(item.summary || '')}</div>
+        </div>`).join('')}
+      </div></div>`;
+  }
+  if (block.kind === 'user') {
+    return `<div class="msg user">
+      <div class="msg-avatar">人</div>
+      <div class="msg-body"><div class="msg-tag">人类介入</div>${rich(block.text)}</div></div>`;
+  }
+  if (block.kind === 'assistant') {
+    return `<div class="msg assistant">
+      <div class="msg-avatar">AI</div>
+      <div class="msg-body">
+        ${block.text ? rich(block.text) : ''}
+        ${!block.text && !block.calls.length ? '<p class="muted">（空回复）</p>' : ''}
+        ${block.reasoning ? `<details class="raw"><summary>思考过程</summary><pre class="code scroll">${esc(block.reasoning)}</pre></details>` : ''}
+        ${block.calls.map((call) => toolCard(call.name, call.args, call.result)).join('')}
+      </div></div>`;
+  }
+  if (block.kind === 'orphan') {
+    return `<div class="msg tool-orphan"><div class="msg-avatar">⚙</div><div class="msg-body"><div class="msg-tag">无对应调用的工具结果</div>${jsonBlock(safeParse(block.text), { label: '原始结果' })}</div></div>`;
+  }
+  return '';
+}
+
+/* ----------------------------------------------------------------- 文件 */
 export function renderFiles({ changes, history, conflicts, omitted }) {
   const openConflicts = (conflicts || []).filter((conflict) => conflict.status === 'open');
   return `
