@@ -112,7 +112,7 @@ export function renderHero({ models, defaultWorkspace }) {
 export function renderRunHeader(run) {
   return `<div class="run-header">
     <div class="run-header-main">
-      <h1 class="run-title">${esc(run.goal)}</h1>
+      <h1 class="run-title" data-goal data-goal-key="run"><span class="goal-text">${esc(run.goal)}</span><button class="goal-more" type="button" data-action="goal-toggle" hidden>展开目标</button></h1>
       <div class="run-meta">
         ${pill(run.status)}
         ${monoPill('r' + run.revision)}
@@ -935,9 +935,9 @@ export function renderConversation({ run, agent, agents, questions, selected, co
         <div class="chat-meta">${meta}</div>
       </div>
     </div>
-    <div class="chat-goal">
-      <div class="chat-goal-text">${esc(agent.goal || '')}</div>
-      <button class="chat-goal-more" type="button" data-action="goal-toggle" hidden>展开目标</button>
+    <div class="chat-goal" data-goal data-goal-key="${attr(agent.id || 'agent')}">
+      <div class="goal-text">${esc(agent.goal || '')}</div>
+      <button class="goal-more" type="button" data-action="goal-toggle" hidden>展开目标</button>
     </div>
     ${unread ? `<div class="note tiny">还有 ${unread} 条消息没被这个 Agent 读到（下一轮会读到）。</div>` : ''}
     ${waitNote}

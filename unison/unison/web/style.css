@@ -716,22 +716,22 @@ details.raw > summary:hover { color: var(--c-text-2); }
   border-radius: 0 var(--r-md) var(--r-md) 0;
   font-size: var(--fs-13); line-height: var(--lh-13); color: var(--c-text);
 }
-.chat-goal-text { white-space: pre-wrap; }
-
-/* 主目标折叠（见 app.js `setupChatGoal`）。
-   目标长的时候它一个人就能占满整个对话视口——实测某个 1060 字的目标渲染成 524px，
-   而对话区视口只有 435px，于是**整屏只有目标，一句对话都看不到**。
-   判据是测量出来的（超过 3 行才算长），短目标不会进入这个状态，也不会多出任何按钮。
-   折叠后只显示 2 行：`-webkit-line-clamp` 会自带省略号，比 max-height 截断诚实。 */
-.chat-goal.is-collapsed .chat-goal-text {
+/* 目标折叠（见 app.js `setupChatGoal`）：`[data-goal]` 是块，`.goal-text` 是要被夹住的那段文字。
+   两处目标共用同一套：页面顶部的**主目标**（`.run-title`）与当前 Agent 的目标（`.chat-goal`）。 */
+/* `display:block` 是必须的，不是样式偏好：判"长不长"要读 `scrollHeight`，而它对**行内元素**
+   不可靠（主目标在 h1 里就是个 span，实测因此被判成"短"、机制整块跳过）。 */
+.goal-text { display: block; white-space: pre-wrap; }
+[data-goal].is-collapsed .goal-text {
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
 }
-.chat-goal-more {
-  margin-top: var(--sp-2); padding: 2px var(--sp-2); cursor: pointer;
+.goal-more {
+  display: block; margin-top: var(--sp-2); padding: 2px var(--sp-2); cursor: pointer;
   border: 1px solid var(--c-line-3); border-radius: var(--r-sm); background: var(--c-bg-raised);
-  font: inherit; font-size: var(--fs-11); line-height: var(--lh-11); color: var(--c-text-2);
+  font-family: var(--font-sans); font-size: var(--fs-11); line-height: var(--lh-11);
+  font-weight: 400; color: var(--c-text-2);
 }
-.chat-goal-more:hover { background: var(--c-bg-hover); color: var(--c-text); }
+.goal-more:hover { background: var(--c-bg-hover); color: var(--c-text); }
+
 .chat-log { display: flex; flex-direction: column; gap: var(--sp-4); margin-top: var(--sp-4); }
 .chat-answered { margin-top: var(--sp-5); border-top: 1px solid var(--c-line-1); padding-top: var(--sp-3); }
 .chat-answered h4 { font-size: var(--fs-12); color: var(--c-text-3); margin-bottom: var(--sp-2); }

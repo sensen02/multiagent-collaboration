@@ -189,113 +189,177 @@ function restoreChatScroll(snapshot) {
 }
 
 /**
- * 主目标折叠：目标长的时候它一个人就占满整个对话视口。
+ * 目标折叠：把占满屏幕的长目标收起来。
  *
- * 真机测量（`run_1da778c90c48` 的根任务目标，1060 字）：渲染成 **524px = 26 行**，
- * 而 `.chat-scroll` 的视口只有 435px——于是整屏只有目标，`.chat-log` 从 y=935 开始，
- * 一句对话都看不到。
+ * 覆盖**两处**目标——页面顶部的**主目标**（`.run-title`）与当前 Agent 的目标（`.chat-goal`）。
+ * 真机现场（`run_1da778c90c48`）：主目标正文 3465 字渲染成 **1830–2912px**，挂在所有标签页
+ * **上方**；它一个人比整个可视区还高，往下滚几百像素看到的还是它。只折叠 `.chat-goal`
+ * 完全没用——用户看到的是主目标。
  *
  * 三条规则：
  *
- * 1. **判据是测量出来的，不是字数**：超过 `GOAL_SHORT_LINES` 行才算"长"，折叠后显示
- *    `GOAL_COLLAPSED_LINES` 行。短目标不进这个状态，也不多出任何按钮（少一个可以困惑的地方）。
- * 2. **往下滑自动折叠，滑回顶部自动展开**。这是用户明确要的：目标不该永远占着屏幕，
- *    但"我到底在做什么任务"要能一眼看回来。
- * 3. **折叠/展开时补偿 `scrollTop`**（按被收起的高度），正在看的内容不会跳；
- *    展开发生在顶部时直接回到 0，让目标从头显示。
+ * 1. **判"长"是测量出来的，不是字数**：超过 `GOAL_SHORT_LINES` 行才算长，折叠后显示
+ *    `GOAL_COLLAPSED_LINES` 行。短目标不进这个机制，也不多出按钮。
+ * 2. **触发看"被推出视野多少"**，而不是某个固定容器的 `scrollTop`。两个实测教训：
+ *    对话页真正的滚动容器是 `main.main`（`.main { overflow-y: auto }`），而长目标下
+ *    `.chat-scroll` 只有 115px、根本滚不动；而且判长要读 `scrollHeight`——它对**行内元素**
+ *    不可靠（主目标在 `h1` 里就是个 span，因此被判成"短"、整块跳过，见 CSS 里的 `display:block`）。
+ * 3. **折叠按被收起的高度补偿滚动位置**：主目标能收起 2800px，不补偿就是一次画面跳转。
+ *    补偿后若已回到顶部就停在 0——用户要的正是"目标收起来，下面的内容立刻能看"。
  *
- * 两个阈值分开（72 / 8）是有意的**迟滞**：折叠会减少内容高度，如果折叠与展开用同一个阈值，
- * 折叠把 scrollTop 拉到阈值以下就会立刻自我展开，来回抖动。
- * 手动点「展开目标」后 `manual` 置位，不再自动折叠，直到用户自己滑回顶部。
+ * 用**滚动方向 + 时间护栏**决定何时展开，而不是位置：折叠的补偿会把 `scrollTop` 拉回 0，
+ * 浏览器为此再发一次 scroll 事件，若"在顶部"就等于"展开"，它会在自己的补偿结果上反复横跳。
+ * 现在：**向下滚 + 被推出视野 → 折叠；向上滚 + 已在顶部 + 距上次折叠超过 `GOAL_SETTLE_MS` → 展开**。
+ * （早先版本用"记下自己造成的滚动位置"来识别回声，但那个一次性标记会被 SSE 重画复位，
+ * 实测仍会自激；时间护栏不依赖任何会被重画清掉的东西。）
  *
- * 状态存在模块级变量里而不是 DOM 上：SSE 每有新事件就整区重画，DOM 上的状态活不过一次刷新。
+ * 状态存模块级 Map（键是 `data-goal-key`）而不是 DOM：SSE 每有新事件就整区重画，
+ * DOM 上的状态活不过一次刷新。
  */
 const GOAL_SHORT_LINES = 3;
 const GOAL_COLLAPSED_LINES = 2;
-const GOAL_COLLAPSE_AT = 72;
-const GOAL_EXPAND_AT = 8;
-const goalState = { taskId: null, collapsed: false, manual: false };
+const GOAL_COLLAPSE_AT = 4;      // 目标顶部被推到滚动视口顶边之上多少像素才折叠
+const GOAL_SETTLE_MS = 700;      // 折叠后多久内不接受"回到顶部就展开"（用于忽略自己的回声）
+const goalStates = new Map();    // key → {collapsed, manual, collapsedAt}
 
-function goalElements() {
-  return {
-    goal: document.querySelector('.chat-goal'),
-    text: document.querySelector('.chat-goal-text'),
-    more: document.querySelector('.chat-goal-more'),
-    scroller: document.querySelector('.chat-scroll'),
-  };
+function goalBlocks() {
+  return [...document.querySelectorAll('[data-goal]')];
 }
 
-function applyGoalCollapsed(collapsed) {
-  const { goal, more } = goalElements();
-  if (!goal) return 0;
-  const before = goal.getBoundingClientRect().height;
-  goalState.collapsed = collapsed;
-  goal.classList.toggle('is-collapsed', collapsed);
-  if (more) more.hidden = !collapsed;
-  return before - goal.getBoundingClientRect().height;   // 被收起的高度
+function goalStateOf(block) {
+  const key = block.dataset.goalKey || 'goal';
+  if (!goalStates.has(key)) goalStates.set(key, { collapsed: false, manual: false, collapsedAt: 0 });
+  return goalStates.get(key);
 }
 
-function onGoalScroll() {
-  const { goal, scroller } = goalElements();
-  if (!goal || !scroller || goal.dataset.long !== 'yes') return;
-  const top = scroller.scrollTop;
-  if (top <= GOAL_EXPAND_AT) {
-    goalState.manual = false;
-    if (goalState.collapsed) {
-      applyGoalCollapsed(false);
-      scroller.scrollTop = 0;
-    }
-    return;
+/** 目标所属的滚动容器：往上找第一个**真的能滚**的祖先；都没有就退回页面本身。 */
+function goalScroller(el) {
+  for (let node = el.parentElement; node; node = node.parentElement) {
+    const style = getComputedStyle(node);
+    if (/(auto|scroll|overlay)/.test(style.overflowY) && node.scrollHeight > node.clientHeight + 1) return node;
   }
-  if (goalState.manual || goalState.collapsed || top <= GOAL_COLLAPSE_AT) return;
-  const saved = applyGoalCollapsed(true);
-  if (saved > 0) scroller.scrollTop = Math.max(GOAL_EXPAND_AT + 1, top - saved);
+  return document.scrollingElement || document.documentElement;
+}
+
+/** 目标顶部被推出滚动视口多少像素（负值表示还在视口顶边下方）。 */
+function goalPushedOut(block) {
+  const scroller = goalScroller(block);
+  const viewTop = Math.max(0, scroller.getBoundingClientRect().top);
+  return viewTop - block.getBoundingClientRect().top;
+}
+
+/** 套用折叠状态；`compensate` 为真时按被收起的高度补偿滚动位置。 */
+function applyGoalState(block, collapsed, compensate = false) {
+  const state = goalStateOf(block);
+  const scroller = goalScroller(block);
+  const before = block.getBoundingClientRect().height;
+  const changed = state.collapsed !== collapsed;
+  state.collapsed = collapsed;
+  // 只在**状态真的变化**时打时间戳。每次重画都会把状态重新套一遍，
+  // 若那时也刷新时间戳，"刚折叠"会永远成立，回顶展开就永远被护栏挡住（实测如此）。
+  if (collapsed && changed) state.collapsedAt = Date.now();
+  block.classList.toggle('is-collapsed', collapsed);
+  const more = block.querySelector('.goal-more');
+  if (more) more.hidden = !collapsed;
+  const saved = before - block.getBoundingClientRect().height;
+  // **有空间才补偿**。补偿是为了让"正在看的内容不动"；但如果收起的高度超过已滚距离，
+  // 补偿会一路冲到顶部——那就把用户顶到顶上，而"在顶部"又意味着该展开（自相矛盾，
+  // 而且实测会互相打架）。冲得到顶的时候就**不补偿**：让下面的内容顺势上移，
+  // 用户往上滚回顶部时目标还会自己展开，两条行为都保住了。
+  if (compensate && saved > 0) {
+    const next = scroller.scrollTop - saved;
+    if (next > 0) scroller.scrollTop = next;
+  }
+  return saved;
+}
+
+function onGoalScroll(event) {
+  const scroller = event.target;
+  if (!scroller || typeof scroller.scrollTop !== 'number') return;
+  const top = scroller.scrollTop;
+  const goingDown = top > (onGoalScroll.lastTop ?? 0);
+  onGoalScroll.lastTop = top;
+  for (const block of goalBlocks()) {
+    if (block.dataset.long !== 'yes') continue;
+    const state = goalStateOf(block);
+    if (top <= 2) state.manual = false;               // 回到顶部即解除手动
+    const settled = Date.now() - (state.collapsedAt || 0) > GOAL_SETTLE_MS;
+    if (!goingDown && top <= 2 && settled) {          // 向上滚到顶 → 展开
+      if (state.collapsed) applyGoalState(block, false);
+      continue;
+    }
+    if (!goingDown || state.manual || state.collapsed) continue;
+    if (goalPushedOut(block) < GOAL_COLLAPSE_AT) continue;
+    applyGoalState(block, true, true);                // 向下滚且已被推出视野 → 折叠
+  }
 }
 
 /**
- * 重画后重建目标折叠状态。
+ * 重画后重建折叠状态（每次 renderMain 都要跑）。
  *
  * 必须在 `restoreChatScroll()` **之前**调用：这里只按记住的状态套类、不做滚动补偿，
- * 让 `restoreChatScroll` 面对的是最终布局（否则每次 SSE 刷新都会因为高度变化跳一下）。
- * "长不长"要在这时候量——此刻元素是全新的、还没套过折叠类，`scrollHeight` 是完整内容高度。
+ * 让恢复滚动位置时面对的是最终布局，否则每次 SSE 刷新都会跳一下。
+ * "长不长"要在这时候量——此刻元素是全新的、还没套过折叠类，高度就是完整内容高度。
  *
- * `entering` 表示"刚切进对话页"（没有滚动快照，接下来一定停在顶部）。这时清掉折叠状态，
- * 与"滑到顶就展开"保持一致——否则会出现"人在顶部、目标却收着"这种自相矛盾的画面。
+ * `entering` 表示刚切进对话页（接下来一定停在顶部）：清掉状态，与"滑到顶就展开"一致。
  */
 function setupChatGoal(entering = false) {
-  const { goal, text, scroller } = goalElements();
-  if (!goal || !text || !scroller) return;
-  const key = view.agentTask || 'root';
-  if (goalState.taskId !== key || entering) {
-    goalState.taskId = key;
-    goalState.collapsed = false;
-    goalState.manual = false;
+  if (entering) goalStates.clear();
+  onGoalScroll.lastTop = null;
+  for (const block of goalBlocks()) {
+    const text = block.querySelector('.goal-text');
+    if (!text) continue;
+    const line = parseFloat(getComputedStyle(text).lineHeight) || 20;
+    block.dataset.long = text.scrollHeight > line * GOAL_SHORT_LINES + 1 ? 'yes' : 'no';
+    if (block.dataset.long !== 'yes') {
+      goalStateOf(block).collapsed = false;
+      block.classList.remove('is-collapsed');
+      const more = block.querySelector('.goal-more');
+      if (more) more.hidden = true;
+      continue;
+    }
+    applyGoalState(block, goalStateOf(block).collapsed);
   }
-  const line = parseFloat(getComputedStyle(text).lineHeight) || 20;
-  goal.dataset.long = text.scrollHeight > line * GOAL_SHORT_LINES + 1 ? 'yes' : 'no';
-  if (goal.dataset.long !== 'yes') {
-    goalState.collapsed = false;
-    goal.classList.remove('is-collapsed');
-    return;
-  }
-  applyGoalCollapsed(goalState.collapsed);
 }
 
-// 滚动监听挂在 document 上、用捕获阶段：滚动事件不冒泡，但捕获阶段能拿到**任意**容器的滚动，
-// 因此不必每次重画都往新元素上重挂一次。代价是回调会在任何滚动里跑，所以它第一件事就是确认
-// 目标块存在且确实"长"——短目标、别的标签页、别的滚动都直接返回。
+/**
+ * 「往上划到头」= 向上滚的手势，而不是"滚动事件说位置回到了顶部"。
+ *
+ * 为什么必须听手势：折叠会让页面变短，浏览器会把 `scrollTop` 夹回 0（实测折叠后 17ms
+ * 就来了一条 `top=0` 的 scroll 事件——护栏挡住了它），此后**页面已经没有可滚空间**，
+ * 用户再怎么往上划也不会产生 scroll 事件，于是"回顶展开"永远等不到。
+ * 手势是直接的意图，且在没有滚动空间时照样会发出来——这正是"划到头"的那一刻。
+ */
+function expandGoalsAtTop() {
+  for (const block of goalBlocks()) {
+    if (block.dataset.long !== 'yes') continue;
+    const state = goalStateOf(block);
+    if (!state.collapsed) continue;
+    if (goalScroller(block).scrollTop > 2) continue;   // 还没到顶：先让滚动正常发生
+    applyGoalState(block, false);
+  }
+}
+document.addEventListener('wheel', (event) => { if (event.deltaY < 0) expandGoalsAtTop(); },
+                          { capture: true, passive: true });
+
+// 滚动监听挂在 document 的捕获阶段：滚动事件不冒泡，但捕获阶段能拿到**任意**容器的滚动，
+// 因此不必每次重画都往新元素上重挂。它管**折叠**（往下滚）与键盘等非滚轮输入下的展开。
+onGoalScroll.lastTop = null;
 document.addEventListener('scroll', onGoalScroll, { capture: true, passive: true });
 
 /**
- * 手动展开（点「展开目标」）。只做展开这一个方向：自动折叠仍然归滚动管，
- * 所以不会出现"按钮说收起、滚动说展开"互相打架的状态。
+ * 手动展开（点「展开目标」）。只做展开这一个方向，自动折叠仍归滚动管，
+ * 因此不会出现"按钮说收起、滚动说展开"互相打架。
  */
-function expandChatGoal() {
-  const { scroller } = goalElements();
-  if (!goalState.collapsed) return;
-  const saved = applyGoalCollapsed(false);
-  goalState.manual = true;
-  if (scroller && saved < 0) scroller.scrollTop -= saved;   // 内容在上方长高了，补回去
+function expandChatGoal(button) {
+  const block = button?.closest('[data-goal]');
+  if (!block) return;
+  const state = goalStateOf(block);
+  if (!state.collapsed) return;
+  const scroller = goalScroller(block);
+  const saved = applyGoalState(block, false);
+  state.manual = true;
+  if (saved < 0) scroller.scrollTop = Math.max(0, scroller.scrollTop - saved);   // 上方长高了，补回去
 }
 
 /**
@@ -665,7 +729,7 @@ const actions = {
 
   'close-drawer': () => closeDrawer(),
 
-  'goal-toggle': () => expandChatGoal(),
+  'goal-toggle': (el) => expandChatGoal(el),
 
   'answer': (el) => withBusy(el, async () => {
     await api.post('answer', { id: el.dataset.question, answer: el.dataset.answer });
