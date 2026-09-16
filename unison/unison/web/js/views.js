@@ -969,8 +969,17 @@ export function renderConversation({ run, agent, agents, questions, selected, co
 export function renderComposer({ run, target, fallbackFrom = null, draft = '', disabled = false }) {
   if (!run) return '';
   if (!target) {
+    // **草稿照样留在屏幕上**：以前这里只返回一句提示，连 textarea 带用户正在打的字一起消失
+    // ——"打着打着字就没了"就是这么来的（任务随时可能因为 503 之类的原因变成终态）。
+    // 字段不可编辑、按钮禁用，但文字留在这里，等有任务可接收时接着发。
     return `<div class="composer" role="group" aria-label="对话">
       <div class="composer-note warn">这个运行现在没有可接收消息的任务：任务都已结束、已取消，或只剩下旧目标版本的任务。用「修改目标」开新版本，或先「继续运行」。</div>
+      <div class="composer-row">
+        <textarea name="prompt" rows="1" disabled aria-label="草稿（暂时无法发送）"
+          placeholder="等有任务可接收消息时再发">${esc(draft)}</textarea>
+        <button class="btn primary" type="submit" disabled>发送</button>
+      </div>
+      <div class="composer-hint tiny muted">这段草稿会留在这里，不会因为任务状态变化而消失。</div>
     </div>`;
   }
   const role = target.parent_id ? 'child' : 'root';

@@ -34,6 +34,9 @@ const view = {
   agentTask: null,
   jumpedQuestions: new Set(),
   compose: { runId: null, text: '' },
+  // 输入栏的瞬时状态：是否曾拿到焦点、是否正在输入法组词。
+  // 组词期间**不重画**——重画会把输入法的候选状态连带没上屏的字一起丢掉。
+  composerState: { focused: false, composing: false },
   drawer: null, // { kind: 'task' | 'blob' | 'skill', ... }
   lastArchive: null,
   archivedOpen: false,   // “已归档会话”默认折叠
@@ -149,10 +152,30 @@ function composeHtml(run, agents) {
  * 草稿与焦点必须自己留住：SSE 每次有新事件都会重画整个主区（`host.innerHTML = …`），
  * 不保的话用户正在打的字会被下一次刷新抹掉，光标也会跳走。
  */
+/**
+ * 重画前记下输入栏的状态。
+ *
+ * 三件事都要记，缺一件就会吞字：
+ * - `text`：**以 DOM 为准**。草稿平时靠 `input` 事件写进 `view.compose`，但那是"上一次事件"
+ *   的值；快照是紧挨着重画取的，DOM 才是用户此刻看到的真值。
+ * - `focus`：以前只在"`document.activeElement` 正好是 textarea"时才返回快照，否则
+ *   `restoreComposer` 直接 return、**不重新聚焦**——用户接着打的字全进了空气。
+ *   现在改成"输入栏曾经拿到过焦点就记着"（`composerState.focused`），不依赖取样那一瞬。
+ * - `start`/`end`：光标位置。
+ */
+function isComposerField(el) {
+  return !!el && el.tagName === 'TEXTAREA' && el.form?.dataset?.action === 'compose';
+}
+
 function composeFocusSnapshot() {
-  const el = document.activeElement;
-  if (!el || el.tagName !== 'TEXTAREA' || el.form?.dataset?.action !== 'compose') return null;
-  return { start: el.selectionStart, end: el.selectionEnd };
+  const el = document.querySelector('form[data-action="compose"] textarea[name="prompt"]');
+  if (!el) return null;
+  return {
+    text: el.value,
+    start: el.selectionStart,
+    end: el.selectionEnd,
+    focus: document.activeElement === el || view.composerState.focused,
+  };
 }
 
 function autoGrowComposer(el) {
@@ -163,8 +186,13 @@ function autoGrowComposer(el) {
 function restoreComposer(snapshot) {
   const el = document.querySelector('form[data-action="compose"] textarea[name="prompt"]');
   if (!el) return;
+  if (snapshot?.text && el.value !== snapshot.text) {
+    // DOM 比草稿新：以 DOM 为准写回，别让重画把最后几个字吞掉。
+    el.value = snapshot.text;
+    view.compose = { runId: el.form?.dataset?.run || null, text: snapshot.text };
+  }
   autoGrowComposer(el);
-  if (!snapshot) return;
+  if (!snapshot?.focus) return;
   el.focus();
   const max = el.value.length;
   const start = Math.min(snapshot.start ?? max, max);
@@ -536,6 +564,12 @@ async function renderMain() {
 
 async function refresh() {
   if (refreshing) {
+    pendingRefresh = true;
+    return;
+  }
+  // 输入法组词期间不重画：整区重画会把候选状态和还没上屏的字一起丢掉（"打着打着字就没了"）。
+  // 组词结束后 `compositionend` 会补一次 refresh，所以这里推迟不会让界面停在旧状态。
+  if (view.composerState?.composing) {
     pendingRefresh = true;
     return;
   }
@@ -1087,6 +1121,22 @@ document.addEventListener('input', (event) => {
   if (el?.name !== 'prompt' || el.form?.dataset?.action !== 'compose') return;
   view.compose = { runId: el.form.dataset.run || null, text: el.value };
   autoGrowComposer(el);
+});
+
+// 输入栏的焦点与输入法状态：重画要据此决定"要不要重新聚焦""能不能现在重画"。
+document.addEventListener('focusin', (event) => {
+  if (isComposerField(event.target)) view.composerState.focused = true;
+});
+document.addEventListener('focusout', (event) => {
+  if (isComposerField(event.target)) view.composerState.focused = false;
+});
+document.addEventListener('compositionstart', (event) => {
+  if (isComposerField(event.target)) view.composerState.composing = true;
+});
+document.addEventListener('compositionend', (event) => {
+  if (!isComposerField(event.target)) return;
+  view.composerState.composing = false;
+  refresh();          // 组词期间被推迟的刷新，现在补上
 });
 
 document.addEventListener('keydown', (event) => {
