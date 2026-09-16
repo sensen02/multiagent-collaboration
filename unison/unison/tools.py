@@ -37,7 +37,7 @@ TOOLS = [
        'request_id':S,'in_reply_to':S,'relay_of':S},['task_id','summary']),
  tool('tasks_close','收束某任务前先排空它在途请求：mode=drain 等它答完（或到时限），mode=forfeit 显式作废并通知对方不必再答。不要在对方还有未答问题时强行让它汇报，那样会留下无人认领的答复。',
       {'source_task':S,'mode':{'type':'string','enum':['drain','forfeit']},'request_ids':A,'timeout_seconds':{'type':'number'},'reason':S},['source_task']),
- tool('tasks_cancel','取消任务及子树；历史产物保留。',{'task_id':S},['task_id']),
+ tool('tasks_cancel','删除一个子 Agent（可删任意同版本任务，含其子树）：立即终止它的会话——在飞的模型调用被打断、正在跑的那条 shell 被杀——并**释放它占用的全部命令**，包括用 setsid/nohup 甩出去的常驻进程（按 UNISON_TASK_ID 身份标记清扫；释放了什么写进 TaskProcessesReleased 事件、也直接回在 released_processes 里）。历史产物保留，取消不是回滚，被删的任务仍可在「轨迹」「文件」里查证。收束一个还在等答复的任务之前先用 tasks_close 排空它的在途请求。',{'task_id':S},['task_id']),
  tool('human_ask','向人类提出问题。**整个运行会因此暂停**：所有 Agent 做完当前这一轮就停手，人类回答后自动继续，回答作为消息回到你手里。所以提问前先想清楚——这一问会让全队一起等；答案不依赖人类的问题（读文件、跑测试、问同伴）不要用它。必须为本轮最后一个工具。',{'question':S,'options':A},['question']),
  tool('workspace_list','列出文件或目录。所有模型均可直接操作代码。',{'path':S}),
  tool('workspace_read','按行读取文件，默认最多 200 行，长文件按需读取。',{'path':S,'start':I,'limit':I},['path']),

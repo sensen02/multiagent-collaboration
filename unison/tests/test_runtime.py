@@ -1,5 +1,7 @@
 import asyncio
 import json
+import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -1297,6 +1299,104 @@ goals=true
         await self.wait_until(lambda:self.r.task(t['id'])['status']=='failed')
         self.assertEqual(self.r.task(t['id'])['model_id'],'P:bad')
         self.assertFalse([e for e in self.r.store.events(t['run_id']) if e['type']=='ModelFailover'])
+
+    async def test_compact_also_fails_over(self):
+        """压缩也是一次真实的模型调用，它同样会撞上 503——不能绕过故障转移。
+
+        真机 `task_b5bf6929c57f` 就死在**压缩这一次调用**上：同一条 run 里别的模型好好
+        的，这个任务却被判死。事件日志里那段没有 `ModelCalled`，正是"不是普通轮次"的指纹
+        （`ModelCalled` 只由普通轮次与失败转移后的重试写）。
+        """
+        self.failover_provider(['bad','good'])
+        run=self.r.create_run('compact failover',str(self.project),'P:bad')
+        t=self.r.task(run['root_task']); t.update(status='running',epoch=1)
+        for i in range(4):
+            self.r.seed_history(t,[
+                {'role':'assistant','tool_calls':[{'id':str(i),'type':'function','function':{'name':'workspace_list','arguments':'{}'}}]},
+                {'role':'tool','tool_call_id':str(i),'content':'[]'}])
+        self.r.store.put('task',t)
+        async def adapter(config,messages,tools):
+            if config['model']=='bad':
+                raise ModelError('Model HTTP 503: Service Unavailable：提示词安全审计暂时不可用','SERVER')
+            return {'role':'assistant','content':dumps({'decisions':[],'pending':[],'evidence_refs':[]})},{}
+        self.r.models.adapters['fake']=adapter
+        await self.r.compact(self.r.task(t['id']),1)
+        self.assertEqual(self.r.task(t['id'])['model_id'],'P:good')
+        self.assertTrue([e for e in self.r.store.events() if e['type']=='ModelFailover'])
+        self.assertTrue([e for e in self.r.store.events() if e['type']=='ContextCompacted'])
+
+    # ---- 删除子 Agent：终止会话 + 释放它占用的全部命令 ----
+
+    async def test_shell_environment_carries_task_identity(self):
+        """身份标记是"这个任务还欠着哪些命令"的唯一判据，必须注入每条命令。"""
+        run,t=self.create('identity')
+        env=self.r.shell_environment(t)
+        self.assertEqual(env['UNISON_TASK_ID'],t['id'])
+        self.assertEqual(env['UNISON_RUN_ID'],run['id'])
+
+    async def test_cancel_releases_detached_processes(self):
+        """删除子 Agent 必须真的把它占的东西还回来。
+
+        真机 `run_1da778c90c48`：930 世界处理的 `dataset_runner.py` 是被甩出去的常驻作业
+        （新会话、新进程组、父进程变成 systemd），`self.processes` 里没有它，
+        于是取消任务**杀不到它**，CPU 与磁盘一直被占着，看门狗还在等一个不会结束的进程。
+        """
+        run,t=self.create('release')
+        detached=subprocess.Popen(['/bin/bash','-c','sleep 300'],start_new_session=True,
+                                  env=dict(os.environ,UNISON_TASK_ID=t['id'],UNISON_RUN_ID=run['id']))
+        await asyncio.sleep(.3)
+        self.r.cancel_task(t['id'])
+        await asyncio.sleep(.3)
+        self.assertIsNotNone(detached.poll(),'脱离的常驻进程必须被释放')
+        fresh=self.r.task(t['id'])
+        self.assertEqual(fresh['status'],'cancelled')
+        self.assertEqual([p['pid'] for p in fresh['released_processes']],[detached.pid])
+        events=[e for e in self.r.store.events() if e['type']=='TaskProcessesReleased']
+        self.assertEqual(len(events),1)
+        self.assertIn('sleep 300',events[0]['payload']['processes'][0]['command'])
+
+    async def test_cancel_spares_other_tasks_processes(self):
+        """只清扫自己的（含子树）：别的运行的进程不能被误伤。
+
+        对照不能选"同一个 run 里的另一个任务"——取消父任务本来就会递归取消整个子树
+        （子树里每个任务各自按自己的标记清扫），那是应有的行为，不是误伤。
+        """
+        run,t=self.create('target')
+        # 另一个项目目录：同一数据目录里两个未结束的运行不能共用同一个项目目录。
+        other_project=Path(self.temp.name)/'unrelated'; other_project.mkdir()
+        run2=self.r.create_run('unrelated',str(other_project),'test')
+        t2=self.r.task(run2['root_task'])
+        keep=subprocess.Popen(['/bin/bash','-c','sleep 300'],start_new_session=True,
+                              env=dict(os.environ,UNISON_TASK_ID=t2['id'],UNISON_RUN_ID=run2['id']))
+        mine=subprocess.Popen(['/bin/bash','-c','sleep 300'],start_new_session=True,
+                              env=dict(os.environ,UNISON_TASK_ID=t['id']))
+        await asyncio.sleep(.3)
+        try:
+            self.r.cancel_task(t['id'])
+            await asyncio.sleep(.3)
+            self.assertIsNotNone(mine.poll())
+            self.assertIsNone(keep.poll(),'别的运行的进程不能被误杀')
+        finally:
+            keep.kill(); keep.wait()
+
+    async def test_history_shortfall_alarm_is_reported_once(self):
+        """派生条数对不上是**报警**，不是日志——不加去重就会变成事件风暴。
+
+        实测：重启打断了一次工具调用（派生 61 条、记录 60 条）之后，这条报警以约
+        1.2 条/秒的速度往库里写，因为它写在读路径上（每次模型调用、每次控制台派生历史
+        都会经过 `task_history`）。事实写一遍就够了，不匹配本身没有被掩盖。
+        """
+        run,t=self.create('shortfall')
+        t['history_messages']=99; self.r.store.put('task',t)   # 记录说 99 条，日志里远没有
+        self.r.seed_history(t,[{'role':'user','content':'a'}])  # 注意：seed 会把这个计数加一
+        fresh=self.r.task(t['id'])
+        expected=fresh['history_messages']
+        for _ in range(5): self.r.task_history(fresh)
+        events=[e for e in self.r.store.events() if e['type']=='HistoryDerivationShortfall']
+        self.assertEqual(len(events),1)
+        payload=events[0]['payload']
+        self.assertEqual(payload['expected'],expected)
+        self.assertLess(payload['derived'],expected)   # 报警的语义：派生出来的比记录的少
 
 
 if __name__ == '__main__':

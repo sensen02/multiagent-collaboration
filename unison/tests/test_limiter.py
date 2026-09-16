@@ -14,7 +14,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unison.models import health_verdict
 from unison.limiter import (MAX_MODEL_RETRIES, RETRYABLE_CODES, QueueTimeout, RateLimiter,
                             backoff_seconds, bucket_key, capacity_of)
-from unison.models import FAILOVER_CODES, Models
+from unison.models import FAILOVER_CODES, ModelError, Models
 from unison.store import Store
 
 
@@ -31,6 +31,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
     seen = []
     prompt_tokens = 100
     completion_tokens = 20
+    truncate = 0        # 声明比实际多写这么多字节 → 客户端读到 EOF，抛 IncompleteRead
 
     def log_message(self, *args):
         pass
@@ -58,7 +59,7 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.send_header('Content-Type', 'application/json')
             if type(self).retry_after is not None and status != 200:
                 self.send_header('Retry-After', str(type(self).retry_after))
-            self.send_header('Content-Length', str(len(body)))
+            self.send_header('Content-Length', str(len(body) + type(self).truncate))
             self.end_headers()
             self.wfile.write(body)
         finally:
@@ -78,6 +79,7 @@ class LimiterHarness(unittest.IsolatedAsyncioTestCase):
         FakeUpstream.seen = []
         FakeUpstream.prompt_tokens = 100
         FakeUpstream.completion_tokens = 20
+        FakeUpstream.truncate = 0
         self.temp = tempfile.TemporaryDirectory()
         self.store = Store(self.temp.name)
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), FakeUpstream)
@@ -381,6 +383,27 @@ class ModelFailoverTargetTests(LimiterHarness):
         for code in ('AUTH', 'MISSING_CREDENTIAL', 'NO_ADAPTER', 'INVALID_REQUEST',
                      'CONTEXT_WINDOW_EXCEEDED'):
             self.assertNotIn(code, FAILOVER_CODES)
+
+
+class TruncatedResponseTests(LimiterHarness):
+    """响应被中途掐断，必须当成**传输问题**，而不是一个没人认识的异常。"""
+
+    async def test_truncated_body_is_classified_as_transport(self):
+        """真机 `run_1da778c90c48` 的根任务死于 `IncompleteRead(62776 bytes read)`。
+
+        `IncompleteRead` 既不是 `URLError` 也不是 `OSError`（它是 `HTTPException`），
+        所以它**逃过了错误码归类**：不重试、不记健康、不故障转移，任务直接带着一句
+        原始异常字符串判死——连"这是传输问题"都看不出来。
+        """
+        FakeUpstream.truncate = 200
+        self.model('fixture')
+        with self.assertRaises(ModelError) as caught:
+            await self.call()
+        self.assertEqual(caught.exception.code, 'TRANSPORT')
+        # 归类对了，两件后续处置才会发生：退避重试、以及够格换模型。
+        self.assertIn('TRANSPORT', RETRYABLE_CODES)
+        self.assertIn('TRANSPORT', FAILOVER_CODES)
+        self.assertEqual(FakeUpstream.calls, 1 + MAX_MODEL_RETRIES)   # 重试真的发生了
 
 
 class RetryableCodeTests(unittest.TestCase):

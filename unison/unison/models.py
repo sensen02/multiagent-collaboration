@@ -1,5 +1,6 @@
 from __future__ import annotations
 import asyncio
+import http.client
 import json
 import os
 import re
@@ -1086,6 +1087,13 @@ class Models:
                                  retry_after=(e.headers.get('Retry-After') if e.headers else None)) from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
                 raise ModelError(f'模型连接失败：{e}', 'TRANSPORT') from None
+            except http.client.HTTPException as e:
+                # **响应被中途掐断**。实测真机 `run_1da778c90c48` 的根任务就是死于
+                # `IncompleteRead(62776 bytes read)`：响应头说好 4 万字节、连接在 6 万字节处断掉。
+                # `IncompleteRead` 既不是 `URLError` 也不是 `OSError`（它是 `HTTPException`），
+                # 于是**逃过了全部错误码归类**——不重试、不记健康、不故障转移，
+                # 任务直接带着一句原始异常字符串判死，连"这是传输问题"都看不出来。
+                raise ModelError(f'模型响应被中断：{e}', 'TRANSPORT') from None
             except ValueError:
                 raise ModelError('模型返回了非 JSON 响应', 'MALFORMED_RESPONSE') from None
             return wire.parse(body)

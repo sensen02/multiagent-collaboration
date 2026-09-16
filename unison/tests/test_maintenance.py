@@ -198,7 +198,9 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         # 这里按实际内置目录算，并逐个核对都出现在目录里。
         bundled = Path(__file__).resolve().parent.parent / 'unison' / 'skills'
         expected = sorted(p.name for p in bundled.iterdir() if (p / 'SKILL.md').is_file())
-        self.assertEqual(first['counts']['skills'], len(expected))
+        # 不断言"总数 == 内置数"：本机完全可能还有用户级技能（`~/.dsh/skills`，例如
+        # `windows-share`），那会让这条断言随开发机的家目录变化而失败——测试不该依赖环境。
+        self.assertGreaterEqual(first['counts']['skills'], len(expected))
         self.assertEqual(first['counts']['changed'], 0)         # 首次建立指纹不算"变化"
         for name in expected:
             self.assertIn(name, first['catalog'])
@@ -210,7 +212,7 @@ class MaintenanceRuntimeTests(unittest.IsolatedAsyncioTestCase):
         (target / 'SKILL.md').write_text('---\nname: playground-skill\ndescription: 工作区技能\n---\n正文\n', encoding='utf-8')
         second = await self.r.maintenance.run_job(job)
         self.assertEqual(second['counts']['changed'], 1)
-        self.assertEqual(second['counts']['skills'], len(expected) + 1)   # 内置 + 工作区技能
+        self.assertEqual(second['counts']['skills'], first['counts']['skills'] + 1)   # 新增的正是工作区技能
         events = [e for e in self.r.store.events() if e['type'] == 'SkillCatalogChanged']
         self.assertEqual(len(events), 1)
         self.assertIn('playground-skill', events[0]['payload']['skills'])

@@ -18,6 +18,10 @@ from .maintenance import Maintenance, built_in_jobs
 from . import providers
 
 TERMINAL = {'completed','failed','cancelled','superseded'}
+
+# `_call_model(tools=...)` 的哨兵：省略参数 = 给本任务的完整工具集；
+# 显式传 None 才是"这次调用不该带上工具"（压缩就是这样）。
+TOOLS_FOR_TASK = object()
 MAX_COMPACT_PER_STEP = 3
 
 # 历史派生（derive_history）真正读的事件类型，就这四种。
@@ -95,6 +99,8 @@ class Runtime:
         self.batch_seconds = batch_seconds
         self.active = {}
         self.processes = {}
+        # "派生条数对不上"的报警去重键：见 `task_history`。一次不匹配只报一次。
+        self.shortfall_reported = set()
         self.closed = False
         self.handlers = {}
         self._derive_cache=None
@@ -217,9 +223,15 @@ class Runtime:
         if not self.has_message_log(task,events): return task.get('history') or []
         messages,_=self.derive_history(task,events)
         # 轻量一致性校验：消息数应当与日志记下的条数一致，不一致说明派生缺了东西。
+        # 报警**每个 (任务, 实际, 期望) 只写一次**：这个函数是读路径（每次模型调用、每次控制台
+        # 派生历史都会经过），在里面无条件写事件，一旦不匹配就变成事件风暴——实测重启打断了一次
+        # 工具调用之后，这条报警以约 1.2 条/秒的速度往库里写。事实写一遍就够了。
         expected=task.get('history_messages')
         if isinstance(expected,int) and expected!=len(messages):
-            self.store.event('HistoryDerivationShortfall',{'derived':len(messages),'expected':expected},task)
+            key=(task['id'],len(messages),expected)
+            if key not in self.shortfall_reported:
+                self.shortfall_reported.add(key)
+                self.store.event('HistoryDerivationShortfall',{'derived':len(messages),'expected':expected},task)
         return messages
 
     def sync_history(self,task):
@@ -930,7 +942,7 @@ class Runtime:
         room=int(config.get('context_window',32768))-int(config.get('max_output',4096))-2048
         return size>room
 
-    async def _call_model(self,t,history,epoch):
+    async def _call_model(self,t,history,epoch,tools=TOOLS_FOR_TASK):
         """模型调用 + 跨模型故障转移。
 
         上游异常不该让任务判死：对**模型侧**的失败（这个模型在本账户下用不了、或这次答不了）
@@ -943,14 +955,18 @@ class Runtime:
 
         候选全部失败时不再换，也不在这里判死——原样抛出，由调用方按既有语义处理。
         凭据、参数、上下文超限这类原因不换模型：它们不是模型侧的原因。
+
+        `tools` 省略时给本任务的完整工具集；**压缩这类"不该调工具"的调用必须显式传 None**，
+        否则模型会以为可以调工具，返回一个没有正文的 tool_call，压缩结果就不再是 JSON。
         """
+        schemas=self.schemas_for_task(t) if tools is TOOLS_FOR_TASK else tools
         candidates=self.models.failover_targets(t['model_id'])
         while True:
             header=self.record_request(t,history)
             self.store.event('ModelCalled',{'model':t['model_id'],'context_epoch':t['context_epoch'],
                                             'input_ref':header['input_ref'],'request_id':header['id']},task=t)
             try:
-                return await self.models.call(t['model_id'],history,self.schemas_for_task(t),
+                return await self.models.call(t['model_id'],history,schemas,
                                               run_id=t['run_id'],task_id=t['id'])
             except ModelError as error:
                 target=next((item for item in candidates if item['id']!=t['model_id']),None)
@@ -1329,16 +1345,72 @@ class Runtime:
         future=self.active.get(id)
         if future and future is not asyncio.current_task(): future.cancel()
 
+    def release_task_processes(self,id):
+        """释放该任务还欠着的**所有命令**，包括已经脱离父进程的常驻作业。
+
+        为什么不能只靠 `self.processes`：它只记得"此刻正在跑的那一条 shell"。命令一旦
+        `setsid`/`nohup ... &` 就脱离了——真机 `run_1da778c90c48` 里 930 世界处理的
+        `dataset_runner.py` 被 systemd 收养、自开了新会话，于是取消任务**杀不到它**，
+        CPU 与磁盘一直被占着，而看门狗 `while kill -0 <pid>` 还在等一个永远不会被释放的进程。
+
+        判据只能是**环境变量**：进程组、会话、父进程都会在脱离时变掉，而 `UNISON_TASK_ID`
+        跨 fork/exec 一路继承。按它清扫，跑多远都找得回来。
+
+        杀法与 `interrupt()` 一致：是进程组组长就杀整组（连带没带标记的子进程），
+        否则只杀该进程（组不是它的，动整组会误伤别人——比如服务自己）。
+        返回被杀清单，调用方写进事件：**释放了什么必须可核对**。
+        """
+        marker=f'UNISON_TASK_ID={id}'.encode()
+        killed=[]
+        for _ in range(2):   # 第二遍收第一遍期间新生的子进程
+            found=self._marked_processes(marker)
+            if not found: break
+            for pid,command in found:
+                try:
+                    if os.getpgid(pid)==pid: os.killpg(pid,signal.SIGKILL)
+                    else: os.kill(pid,signal.SIGKILL)
+                except (ProcessLookupError,PermissionError):
+                    continue
+                killed.append({'pid':pid,'command':command})
+        return killed
+
+    @staticmethod
+    def _marked_processes(marker):
+        """按环境标记找出还活着的进程（pid + 命令行）。读不到的进程跳过，不报错。"""
+        found=[]
+        for entry in os.listdir('/proc'):
+            if not entry.isdigit(): continue
+            pid=int(entry)
+            if pid==os.getpid(): continue
+            try:
+                with open(f'/proc/{pid}/environ','rb') as handle:
+                    if marker not in handle.read().split(b'\0'): continue
+                with open(f'/proc/{pid}/cmdline','rb') as handle:
+                    command=handle.read().replace(b'\0',b' ').decode(errors='replace').strip()
+            except OSError:
+                continue
+            found.append((pid,command[:300]))
+        return found
+
     def cancel_task(self,id,status='cancelled'):
         t=self.task(id)
         children=[x for x in self.store.all('task') if x['parent_id']==id]
         for child in children: self.cancel_task(child['id'],status)
         self.interrupt(id)
+        # `interrupt()` 只终止**这一轮**（在飞的模型调用与正在跑的那条 shell）。
+        # 任务此前留下的常驻/脱离进程不在其中，所以这里再按身份标记清扫一次——
+        # "删除这个子模型"必须真的把它占的东西还回来，否则取消只是改了一个状态字段。
+        # 注意**只在取消时清扫**：`stop()`/重启走 `interrupt()`，故意不动这些进程，
+        # 因为"重启服务"不该顺手杀掉用户特意放出去的持久作业。
+        released=self.release_task_processes(id)
         with self.store.transaction():
             t['epoch']+=1; t['wait']=None
             if t['status'] not in TERMINAL: t['status']=status
             if status=='superseded': t['superseded']=True
             t['terminal_seq']=self.store.event('TaskSuperseded' if status=='superseded' else 'TaskCancelled',{},t)
+            if released:
+                t['released_processes']=released
+                self.store.event('TaskProcessesReleased',{'count':len(released),'processes':released},t)
             self.store.put('task',t)
             for q in self.store.all('question'):
                 if q['task_id']==id and q['status']=='open':
@@ -1551,9 +1623,14 @@ class Runtime:
             # Retrieval checkpoint for pre-existing oversized sessions, explicitly not a complete summary.
             summary={'decisions':[], 'pending':['历史超过单次总结容量；按引用读取原文。'], 'evidence_refs':[ref]}
         else:
-            msg,usage=await self.models.call(t['model_id'],[
+            # 走 `_call_model` 而不是直接 `models.call`：压缩也是一次真实的模型调用，同样会遇上
+            # 上游 503/超时. 实测真机 `task_b5bf6929c57f` 就是死在**压缩这一次调用**上的 503——
+            # 它绕过了故障转移，于是同一条 run 里其他模型好好的，这个任务却被判死
+            # （事件日志里那段没有 `ModelCalled`，正是"不是普通轮次"的指纹）。
+            # 顺带它还拿到了自己的请求信封，压缩用了什么提示词可以逐字重建。
+            msg,usage=await self._call_model(t,[
                 {'role':'system','content':'压缩工作上下文，输出 JSON 对象，含 decisions（决定）, pending（未解决）, evidence_refs（来源）。保留事实与未知，不执行工具，不改用户目标。'},
-                {'role':'user','content':material}],None)
+                {'role':'user','content':material}],epoch,None)
             content=msg.get('content','').strip()
             if content.startswith('```'): content=content.split('\n',1)[1].rsplit('```',1)[0]
             summary=json.loads(content)
@@ -2025,7 +2102,16 @@ class Runtime:
                         '仍有未答请求；请显式放弃（mode=forfeit）或继续等待，不要在此时截断')}
 
     async def tool_tasks_cancel(self,t,a):
-        self.cancel_task(a['task_id']); return {'cancelled':a['task_id']}
+        """删除一个子 Agent：立即终止它的会话并**释放它占用的全部命令**。
+
+        终止的是这一轮（在飞的模型调用 + 正在跑的那条 shell），释放的是它留下的一切
+        ——包括 `setsid`/`nohup` 甩出去的常驻进程，按 `UNISON_TASK_ID` 身份标记清扫。
+        历史产物照旧保留（取消不是回滚），所以被删掉的任务仍可在「轨迹」与「文件」里查证。
+        """
+        self.cancel_task(a['task_id'])
+        fresh=self.task(a['task_id'])
+        return {'cancelled':a['task_id'],'status':fresh['status'],
+                'released_processes':fresh.get('released_processes') or []}
     async def tool_human_ask(self,t,a):
         q={'id':uid('q_'),'task_id':t['id'],'run_id':t['run_id'],'revision':t['revision'],
            'question':a['question'],'options':a.get('options',[]),'status':'open','created':now()}
@@ -2069,7 +2155,12 @@ class Runtime:
                    UNISON_MODEL=config.get('model') or '',
                    UNISON_MODEL_BASE_URL=config.get('base_url') or '',
                    UNISON_MODEL_API=providers.api_of(config) or '',
-                   UNISON_MODEL_API_KEY=key)
+                   UNISON_MODEL_API_KEY=key,
+                   # 身份标记：命令跑到哪里都带着它，因此"这个任务还欠着哪些命令"查得出来。
+                   # 环境变量是唯一能跨 fork/exec/`setsid`/`nohup` 保留下来的东西——
+                   # 会话 id、父进程、进程组都会在脱离时变掉，只有它不变（见 release_task_processes）。
+                   UNISON_TASK_ID=t['id'],
+                   UNISON_RUN_ID=t.get('run_id') or '')
         key_env=str(config.get('key_env') or '').strip()
         if key_env and key:
             # 与用户配置同名，脚本按自己的习惯读哪一个都可以。

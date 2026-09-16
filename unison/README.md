@@ -281,6 +281,7 @@ compact 的容量估算使用保守的 UTF-8 字节上界，不是供应商精�
 
 - `models_credentials` 工具按需返回明文 `api_key`、`base_url`、wire api 与请求头；每次读取写一条 `CredentialsExposed` 事件，可在事件流里审计。
 - `workspace_shell` 启动的子进程带有当前模型信息：`UNISON_MODEL_ID`、`UNISON_MODEL`、`UNISON_MODEL_BASE_URL`、`UNISON_MODEL_API`、`UNISON_MODEL_API_KEY`，以及 `key_env` 指定的同名变量（例如 `DEEPSEEK_API_KEY`）。凭据只存在于子进程环境，不写入工作区文件，因此不会进入文件清单、差异、报告或归档。
+- 每条命令还带**身份标记** `UNISON_TASK_ID` / `UNISON_RUN_ID`。环境变量是唯一能跨 `fork`/`exec`/`setsid`/`nohup` 保留下来的身份（进程组、会话、父进程在脱离时都会变），所以"这个任务还欠着哪些命令"查得出来：**删除一个子 Agent 时**按它清扫并杀掉这些进程（含被甩出去的常驻作业），把释放了什么写进 `TaskProcessesReleased` 事件与工具返回值。注意**只在取消时清扫**——重启走 `interrupt()`，故意不动它们。
 - 外部程序使用同一组 HTTP 端点：`POST /api/runs` 提交目标、`GET /api/wait` 阻塞等结果、`GET /api/task` 取报告、`GET /api/models/credentials` 取明文凭据。浏览器控制台走同源请求免令牌；脚本必须带 `Authorization: Bearer <token>`（令牌见数据目录 `api_token`，或用 `--api-token` / `UNISON_TOKEN` 指定）。
 - 完整端点、错误码与端到端示例见 [docs/API.md](docs/API.md)。
 
